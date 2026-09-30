@@ -1,0 +1,15 @@
+{
+  "name": "march7thassistant-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Linux 上的三月七助手非官方配置面板",
+  "type": "module",
+  "engines": { "node": ">=18.18" },
+  "os": ["linux"],
+  "scripts": {
+    "start": "node server.mjs",
+    "reset-password": "node tools/reset-password.mjs"
+  },
+  "dependencies": { "yaml": "2.9.1", "tar-stream": "^3.1.7" },
+  "license": "GPL-3.0-only"
+}

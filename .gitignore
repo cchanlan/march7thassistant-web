@@ -1,0 +1,16 @@
+node_modules/
+.state/
+.env
+.env.*
+!.env.example
+*.log
+*.bak
+*.tmp
+config.yaml
+config.yml
+!metadata/defaults.yaml
+.verify-*/
+.claude/
+logs/
+backups/
+UserProfile/
