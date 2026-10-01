@@ -4,6 +4,10 @@
 
 不是三月七运行引擎，不代替上游，也不提供游戏账号登录。只支持 Linux，不提供 Windows、macOS 或 Android 专门适配。
 
+## 界面预览
+
+![三月七配置面板界面示例（演示数据）](docs/images/settings-preview.png)
+
 ## 功能
 
 - 浅粉到淡蓝的界面，适配电脑和手机。
