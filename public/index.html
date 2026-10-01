@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#fff9fc">
+  <title>三月七 · 设置</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x2='1' y2='1'%3E%3Cstop stop-color='%23ffeaf5'/%3E%3Cstop offset='1' stop-color='%23eaf3ff'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='20' fill='url(%23g)'/%3E%3Ctext x='32' y='46' text-anchor='middle' font-size='48' fill='%23c478a5'%3E✧%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <section id="login-view" class="login-view" hidden>
+    <form id="login-form" class="login-card">
+      <div class="brand-symbol large" aria-hidden="true">✧</div>
+      <p class="eyebrow">MARCH 7TH ASSISTANT</p>
+      <h1>欢迎回来，开拓者。</h1>
+      <p class="muted">登录后，安排好下一次开拓。</p>
+      <label for="password">访问密码</label>
+      <input id="password" type="password" autocomplete="current-password" placeholder="输入访问密码" required maxlength="256">
+      <p id="login-error" class="error-text" role="alert"></p>
+      <button type="submit" class="button primary">进入设置 <span aria-hidden="true">→</span></button>
+      <p class="login-note">仅供自己的设备访问</p>
+      <details class="password-help"><summary>忘记密码？</summary><p>在服务器上进入与 server.mjs 同级的目录，运行：</p><code>node tools/reset-password.mjs</code></details>
+    </form>
+  </section>
+
+  <div id="app-view" class="app" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="三月七设置首页"><span class="brand-symbol" aria-hidden="true">✧</span><span><strong>三月七</strong><small>ASSISTANT / 设置</small></span></a>
+      <div class="sidebar-section">工作台</div>
+      <nav id="navigation" aria-label="设置分类"></nav>
+      <div class="sidebar-footer"><span class="tiny-star" aria-hidden="true">✦</span><p>准备好了吗？<br><strong>下一站，轻松开拓。</strong></p><small id="version"></small></div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="breadcrumb">三月七助手 <span>/</span> <strong>配置中心</strong></div>
+        <div class="topbar-actions"><span id="container-status" class="status">读取中</span><button id="change-password" class="text-button">修改密码</button><button id="logout" class="text-button">退出</button></div>
+      </header>
+      <main>
+        <section class="intro">
+          <div><p class="eyebrow">MAKE TIME FOR YOUR JOURNEY</p><h1>把日常，交给三月七<span>。</span></h1><p>挑好副本，安排日常，剩下的交给助手。</p></div>
+          <div class="intro-art" aria-hidden="true"><span class="orbit"></span><span class="crystal">✧</span><span class="little-spark one">✦</span><span class="little-spark two">✧</span><span class="art-caption">YOUR NEXT JOURNEY</span></div>
+        </section>
+        <section class="target-card" aria-labelledby="target-heading">
+          <div class="target-heading"><div><h2 id="target-heading">已连接实例</h2><p>选择要调整的三月七助手。</p></div><div class="target-actions"><button id="discover-open" class="button primary">自动发现</button><button id="manual-open" class="button secondary">填写路径</button></div></div>
+          <div class="target-picker"><label for="target-select">当前实例</label><select id="target-select" disabled><option value="">尚未连接实例</option></select><button id="refresh-targets" class="text-button">刷新列表</button><button id="remove-target" class="text-button danger-text" disabled>移除</button></div>
+          <p id="target-path" class="target-path" hidden></p>
+          <p id="runtime-summary" class="runtime-summary" aria-live="polite"></p>
+          <p id="target-error" class="error-text" role="alert" hidden></p>
+          <div id="runtime-warnings" class="notice warning runtime-notice" hidden></div>
+          <details id="runtime-evidence" class="connection-details" hidden><summary>识别信息</summary><ul id="runtime-evidence-list"></ul></details>
+        </section>
+        <section id="connect-state" class="connect-state" hidden><span aria-hidden="true">✧</span><h2>先连接一份助手配置</h2><p>自动发现服务器上的 Docker、Linux 源码、PM2 或 systemd 实例，<br>也可以点击「填写路径」手动接入。</p></section>
+        <div id="config-toolbar" class="toolbar" hidden>
+          <label class="search-wrap"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="搜索设置名称、功能或配置项…" aria-label="搜索全部设置"><kbd>/</kbd></label>
+          <button id="reload" class="button secondary" disabled>↻ <span>重新载入</span></button>
+          <a id="export" class="button secondary export" aria-disabled="true" tabindex="-1" download="config.yaml">↓ <span>导出配置</span></a>
+        </div>
+        <div id="warning-banner" class="notice warning" hidden></div>
+        <div id="offline-banner" class="notice" hidden></div>
+        <section id="settings-section" class="settings-section" hidden>
+          <div class="section-heading"><div><h2 id="section-title">常用设置</h2><p id="section-subtitle">常用的功能放在一起，调整起来更顺手。</p></div><label class="filter-check"><input id="changed-only" type="checkbox">只看已修改</label></div>
+          <div id="settings-list"></div>
+          <div id="empty-state" class="empty-state" hidden><span aria-hidden="true">✧</span><h3>这里暂时没有设置</h3><p>换个关键词，或取消筛选试试。</p></div>
+        </section>
+        <p id="page-note" class="page-note" hidden>每次保存前自动备份 · 只提交你修改的设置</p>
+      </main>
+      <button id="back-to-top" class="back-to-top" type="button" hidden><span aria-hidden="true">↑</span>回到顶部</button>
+      <footer class="savebar"><div class="save-info"><span id="save-dot" class="save-dot"></span><div><strong id="change-count">请先连接实例</strong><small id="save-hint">自动发现，或填写服务器配置路径。</small></div></div><div class="save-actions"><button id="discard" class="button secondary" disabled>撤销修改</button><button id="save" class="button primary" disabled>保存设置 <span aria-hidden="true">→</span></button></div></footer>
+    </div>
+  </div>
+  <dialog id="discover-dialog" class="connect-dialog" aria-labelledby="discover-title">
+    <form id="discover-form" class="connection-form">
+      <div class="dialog-icon" aria-hidden="true">✧</div><h2 id="discover-title">发现服务器上的助手</h2>
+      <p>检测 Docker、Linux 源码、PM2 和 systemd。仅扫描网页服务所在的 Linux 服务器，不会扫描当前手机或电脑，也不会启动程序。</p>
+      <label for="scan-roots">扫描目录 <span class="optional">选填，每行一个</span></label>
+      <textarea id="scan-roots" rows="2" placeholder="例如：/srv/march7thassistant" spellcheck="false" autocapitalize="off"></textarea>
+      <p class="input-help">填写服务器上的绝对目录；留空使用默认范围。</p>
+      <div class="scan-actions"><button id="discover-scan" type="submit" class="button secondary">开始扫描</button><span id="discover-progress" role="status"></span></div>
+      <div id="discover-diagnostics" class="notice warning runtime-notice" hidden></div>
+      <fieldset id="candidate-fieldset" class="candidate-fieldset" hidden><legend>选择要连接的实例</legend><div id="candidate-list"></div></fieldset>
+      <p id="discover-empty" class="discover-empty" hidden>没有发现可接入的实例。可补充扫描目录，或点击「填写路径」。</p>
+      <p id="discover-error" class="error-text" role="alert"></p>
+      <div class="dialog-buttons"><button id="discover-manual" type="button" class="text-button">填写路径</button><button id="discover-cancel" type="button" class="button secondary">关闭</button><button id="candidate-connect" type="button" class="button primary" disabled>连接所选实例</button></div>
+    </form>
+  </dialog>
+  <dialog id="manual-dialog" class="connect-dialog" aria-labelledby="manual-title">
+    <form id="manual-form" class="connection-form">
+      <div class="dialog-icon" aria-hidden="true">✧</div><h2 id="manual-title">填写配置路径</h2>
+      <p>填写网页服务所在 Linux 服务器上的路径，不是手机或电脑上的路径。</p>
+      <label for="manual-config">配置文件路径 <span class="required-note">必填</span></label>
+      <input id="manual-config" type="text" required placeholder="例如：/srv/march7thassistant/config.yaml" spellcheck="false" autocapitalize="off" autocomplete="off">
+      <details class="manual-advanced"><summary>高级选项</summary>
+        <label for="manual-root">安装目录 <span class="optional">选填</span></label><input id="manual-root" type="text" placeholder="例如：/srv/march7thassistant" spellcheck="false" autocapitalize="off" autocomplete="off">
+        <label for="manual-container">Docker 容器名 <span class="optional">选填</span></label><input id="manual-container" type="text" placeholder="例如：march7thassistant" spellcheck="false" autocapitalize="off" autocomplete="off">
+        <label class="file-only-check" for="manual-container-path"><input id="manual-container-path" type="checkbox"><span>填写的是容器内路径</span></label>
+        <p class="input-help">启用后须填写容器名；配置路径和安装目录都填写容器内部的路径。适用于命名卷或没有宿主文件路径的部署。</p>
+      </details>
+      <label class="file-only-check" for="manual-file-only"><input id="manual-file-only" type="checkbox"><span>仅编辑文件，不管理程序</span></label>
+      <p class="input-help">默认自动识别运行方式。选择「仅编辑文件」后，保存前须自行停止程序；只保存文件，不保证自动生效。</p>
+      <p id="manual-error" class="error-text" role="alert"></p>
+      <div class="dialog-buttons"><button id="manual-cancel" type="button" class="button secondary">取消</button><button id="manual-submit" type="submit" class="button primary">连接实例</button></div>
+    </form>
+  </dialog>
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title">
+    <div class="dialog-icon" aria-hidden="true">✧</div><h2 id="confirm-title">确认操作</h2><p id="confirm-copy"></p><ul id="confirm-changes"></ul><div class="dialog-buttons"><button id="confirm-cancel" class="button secondary">取消</button><button id="confirm-ok" class="button primary">确认</button></div>
+  </dialog>
+  <dialog id="password-dialog" aria-labelledby="password-dialog-title">
+    <form id="password-form" class="password-form">
+      <div class="dialog-icon" aria-hidden="true">✧</div>
+      <h2 id="password-dialog-title">修改登录密码</h2>
+      <p class="password-note">修改后，所有设备都需要重新登录。</p>
+      <label for="current-password">当前密码</label>
+      <input id="current-password" type="password" autocomplete="current-password" required maxlength="256">
+      <label for="new-password">新密码</label>
+      <input id="new-password" type="password" autocomplete="new-password" placeholder="8～128 个字符" required minlength="8" maxlength="128">
+      <label for="confirm-password">确认新密码</label>
+      <input id="confirm-password" type="password" autocomplete="new-password" required minlength="8" maxlength="128">
+      <p id="password-error" class="error-text" role="alert"></p>
+      <div class="dialog-buttons"><button id="password-cancel" type="button" class="button secondary">取消</button><button id="password-submit" type="submit" class="button primary">确认修改</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <div id="loading" class="loading"><span class="brand-symbol" aria-hidden="true">✧</span><p>正在读取设置…</p></div>
+</body>
+</html>

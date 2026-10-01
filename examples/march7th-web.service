@@ -1,0 +1,19 @@
+# 将 /path/to/march7thassistant-web 改为安装目录，/path/to/node 改为 command -v node 的结果。
+# 将 User 改为拥有配置与目标服务访问权限的用户，不要直接照抄占位符。
+[Unit]
+Description=March7thAssistant Web
+After=network.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/path/to/march7thassistant-web
+ExecStart=/path/to/node /path/to/march7thassistant-web/server.mjs
+Environment=HOST=127.0.0.1
+Environment=PORT=18077
+Environment=M7A_SEARCH_ROOTS=/path/to/March7thAssistant
+Restart=on-failure
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target
