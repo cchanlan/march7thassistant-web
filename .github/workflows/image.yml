@@ -46,7 +46,9 @@ jobs:
         run: |
           set -euo pipefail
           project="m7a-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          fixture="march7th-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           cleanup() {
+            docker rm -f "$fixture" >/dev/null 2>&1 || true
             docker compose -p "$project" down --volumes --remove-orphans
           }
           trap cleanup EXIT
@@ -71,6 +73,49 @@ jobs:
             docker compose -p "$project" logs --no-color web | grep -F '[宿主桥接]' || true
             exit 1
           fi
+          # 检查真正的登录→发现→接入→读取，不把 healthy 当发现成功。
+          # 夹具只有程序标志和无账号配置，不启动游戏任务。
+          fixture_dir="$RUNNER_TEMP/m7a-discovery"
+          mkdir -p "$fixture_dir/assets/config" "$fixture_dir/module/config"
+          printf 'instance_names: {}\npower_enable: false\ndaily_enable: false\n' > "$fixture_dir/config.yaml"
+          cp "$fixture_dir/config.yaml" "$fixture_dir/assets/config/config.example.yaml"
+          printf 'ci\n' > "$fixture_dir/assets/config/version.txt"
+          printf '{}\n' > "$fixture_dir/assets/config/instance_names.json"
+          printf 'from module.config import cfg\n' > "$fixture_dir/main.py"
+          printf 'class Config:\n    config_path = "config.yaml"\n' > "$fixture_dir/module/config/config.py"
+          printf 'CONFIG_PATH = "config.yaml"\ncfg = Config(CONFIG_PATH)\n' > "$fixture_dir/module/config/__init__.py"
+          docker create --name "$fixture" --workdir / --entrypoint python "$M7A_IMAGE" /ci-game/main.py
+          docker cp "$fixture_dir" "$fixture:/ci-game"
+          docker compose -p "$project" exec -T -e FIXTURE_NAME="$fixture" web node --input-type=module <<'JS'
+          import fs from 'node:fs';
+          import assert from 'node:assert/strict';
+          const origin = `http://127.0.0.1:${process.env.PORT}`;
+          let cookie = '', csrf = '';
+          async function request(route, data) {
+            const response = await fetch(origin + route, {
+              method: data === undefined ? 'GET' : 'POST',
+              headers: { origin, cookie, 'content-type': 'application/json', 'x-csrf-token': csrf },
+              body: data === undefined ? undefined : JSON.stringify(data),
+            });
+            if (response.headers.get('set-cookie')) cookie = response.headers.get('set-cookie').split(';')[0];
+            assert.equal(response.status, 200);
+            return response.json();
+          }
+          csrf = (await request('/api/login', { password: fs.readFileSync(`${process.env.M7A_STATE_DIR}/access.txt`, 'utf8').trim() })).csrf;
+          const found = await request('/api/discover', { roots: ['/root/m7a-ci-missing-directory'] });
+          assert.ok(found.diagnostics.some(message => message.includes('宿主扫描目录')));
+          const candidate = found.candidates.find(item => item.containerName === process.env.FIXTURE_NAME);
+          assert.ok(candidate);
+          assert.equal(candidate.root, '/ci-game');
+          const { target } = await request('/api/targets', { candidateKey: candidate.key });
+          const config = await request(`/api/config?target=${target.id}`);
+          assert.equal(config.version, 'ci');
+          const status = await request(`/api/status?target=${target.id}`);
+          assert.equal(status.canRead, true);
+          assert.equal(status.canWrite, false);
+          assert.equal(status.canRestart, false);
+          console.log('Docker discovery, acceptance and read-only checks passed');
+          JS
       - name: Export the checked image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash

@@ -388,6 +388,31 @@ export async function inspectDocker(spec) {
     version: versionFile.text.trim(), defaults: defaults.text, config,
   }
 }
+function discoveryRoots(info) {
+  const cwd = info.Config?.WorkingDir
+  const roots = []
+  const add = value => {
+    if (typeof value !== 'string' || !value.startsWith('/') || /[\0\r\n]/.test(value)) return
+    const root = path.posix.normalize(value)
+    if (!roots.includes(root)) roots.push(root)
+  }
+  add(cwd)
+  // 这里只提取目录线索；能否控制运行仍由 launchFor 独立核验。
+  const invocation = scriptInvocation([info.Path, ...(info.Args || [])])
+    || (info.Path?.endsWith('.sh') ? scriptInvocation(info.Args || []) : null)
+  if (invocation && (path.posix.isAbsolute(invocation.script) || cwd?.startsWith('/'))) {
+    add(path.posix.dirname(path.posix.resolve(cwd || '/', invocation.script)))
+  }
+  for (const mount of info.Mounts || []) {
+    if (path.posix.basename(mount.Destination || '') === 'config.yaml') add(path.posix.dirname(mount.Destination))
+  }
+  add('/m7a')
+  return roots.slice(0, 8)
+}
+function discoveryFailure(name, root, stage, error) {
+  // execFile 的 message/stderr 可能包含配置内容，不输出原始异常。
+  console.warn('[发现] 容器校验失败', { container: name, root, stage, code: error?.code || error?.status || 'unknown' })
+}
 export async function discoverDocker({ containerName, hostConfig } = {}) {
   const diagnostics = [], candidates = []
   let entries
@@ -395,15 +420,25 @@ export async function discoverDocker({ containerName, hostConfig } = {}) {
     await localDocker()
     if (containerName) entries = [{ Names: containerRef(containerName) }]
     else entries = (await docker(['ps', '-a', '--format', '{{json .}}'])).trim().split(/\r?\n/).filter(Boolean).map(s => JSON.parse(s)).filter(c => /march7th|(?:^|[-_ ])m7a(?:$|[-_ ])/i.test(`${c.Image || ''} ${c.Names || ''} ${c.Labels || ''}`))
-  } catch { return { candidates, diagnostics: ['无法连接本机 Docker，或当前用户没有访问权限；可使用手动路径接入本机配置'] } }
+  } catch (error) {
+    discoveryFailure(containerName || '', '', '连接 Docker', error)
+    return { candidates, diagnostics: ['请检查 Docker socket 挂载与访问权限；镜像部署请使用仓库的完整 compose.yaml'] }
+  }
   if (entries.length > 24) diagnostics.push('候选容器较多，仅检查前 24 个；其他容器请手动填写名称')
   for (const entry of entries.slice(0, 24)) {
     const name = entry.Names
     try {
       const info = await dockerInfo(name)
-      const roots = [...new Set([info.Config.WorkingDir, '/m7a', ...(info.Mounts || []).filter(m => path.posix.basename(m.Destination) === 'config.yaml').map(m => path.posix.dirname(m.Destination))].filter(r => r?.startsWith('/')))]
+      const roots = discoveryRoots(info)
+      // 面板镜像也含 march7th 名称，但不是待接入的游戏实例。
+      if (info.Config?.WorkingDir?.startsWith('/')) {
+        try {
+          const manifest = await readDockerFile(info.Id, path.posix.join(info.Config.WorkingDir, 'package.json'))
+          if (JSON.parse(manifest.text).name === 'march7thassistant-web') continue
+        } catch { /* 不是已确认的面板，继续验证游戏目录。 */ }
+      }
       let found = false
-      for (const root of roots.slice(0, 4)) {
+      for (const root of roots) {
         try {
           let configured = path.posix.join(root, 'config.yaml')
           try {
@@ -417,10 +452,13 @@ export async function discoverDocker({ containerName, hostConfig } = {}) {
           if (hostConfig && (!runtime.canWrite && runtime.warnings.some(w => w.includes('手动路径')))) continue
           candidates.push({ ...spec, configPath: runtime.configPath, label: name, evidence: runtime.evidence, warnings: runtime.warnings })
           found = true; break
-        } catch { /* 下一项独立验证，失败不认为该容器已被识别。 */ }
+        } catch (error) { discoveryFailure(name, root, '程序目录与配置', error) }
       }
-      if (!found && containerName) diagnostics.push('指定容器未能通过三月七目录和配置校验，请检查安装目录与挂载')
-    } catch { diagnostics.push(`无法检查候选容器 ${name}`) }
+      if (!found) diagnostics.push(`请通过「填写路径」接入容器 ${name}，在高级选项选择「填写的是容器内路径」，填写配置路径、容器名和安装目录`)
+    } catch (error) {
+      discoveryFailure(name, '', '容器信息', error)
+      diagnostics.push(`请检查候选容器 ${name} 的状态与访问权限`)
+    }
   }
   return { candidates, diagnostics }
 }

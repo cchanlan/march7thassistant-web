@@ -32,6 +32,14 @@ Web 应部署在三月七所在的 Linux 机器上。浏览器里填写的是**�
 
 **这是接近宿主 root 权限的管理容器，只供可信管理员使用。** Compose 共享宿主 PID、cgroup 和网络，添加 `SYS_ADMIN`、`SYS_CHROOT`、`SYS_PTRACE`、`DAC_READ_SEARCH`、`DAC_OVERRIDE`、`SETUID`、`SETGID`、`KILL`，并关闭默认 seccomp/AppArmor 限制。虽然没有启用 `privileged`、也没有挂载整个宿主 `/`，仍不是安全沙箱；Docker socket 同样具有高权限。
 
+镜像地址为 `ghcr.io/cchanlan/march7thassistant-web:latest`，公开提供匿名拉取，不需要 GitHub 账号或 `docker login`：
+
+```sh
+docker pull ghcr.io/cchanlan/march7thassistant-web:latest
+```
+
+拉取失败时请保留完整错误信息（隐藏凭据），并核对镜像地址、服务器访问 GHCR 的网络和 CPU 架构；不要把所有拉取错误都当成私有镜像。
+
 在服务器终端执行：
 
 ```sh
@@ -157,12 +165,14 @@ sudo systemctl enable --now march7th-web.service
 ### 自动发现
 
 1. 登录后点击「自动发现」。
-2. 可填写服务器扫描目录，每行一个；留空时使用 `M7A_SEARCH_ROOTS` 或当前服务用户的主目录。
+2. 可填写**宿主服务器**扫描目录，每行一个；留空时使用 `M7A_SEARCH_ROOTS` 或当前服务用户的主目录。Docker 容器内路径不填在这里，Docker 发现会单独检查容器。
 3. 查看候选的程序目录、配置路径和识别依据，选择后连接。
 
-发现过程不启动三月七、不重启服务，也不会为了探测而启动 PM2 daemon。扫描有深度、数量和超时限制，不是全盘检索。
+发现过程不启动三月七、不重启服务，也不会为了探测而启动 PM2 daemon。扫描有深度、数量和超时限制，不是全盘检索。部分宿主目录不存在或不可访问时，其余目录与 Docker 发现仍会继续。
 
 Docker 的镜像名、容器名和标签只用于筛选候选，最终仍检查实际程序结构与配置。**完全改名的自定义镜像不保证自动出现**，请通过手动入口填写容器名。没有权限和没有运行实例不是一回事：无法确认时会显示诊断，不把未知状态当成已停止。
+
+Docker 发现会检查工作目录、可识别启动脚本所在目录和配置挂载目录。候选未通过校验时，页面会给出手动接入提示，详细阶段与错误码可在 `docker compose logs --tail=100 web` 中查看。请使用仓库提供的完整 `compose.yaml`；只映射网页端口、不挂载 Docker socket，不能发现其他容器。宿主权限核验失败时不会放开写入或重启保护。
 
 ### 手动填写配置路径
 

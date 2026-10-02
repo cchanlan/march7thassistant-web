@@ -61,17 +61,38 @@ export class Targets {
   }
   async discover(roots, owner) {
     if (roots !== undefined && (!Array.isArray(roots) || roots.length > 8)) throw problem(400, '扫描目录最多填写 8 个')
-    const directories = !roots?.length ? this.roots : roots
-    const canonicalRoots = [...new Set(await Promise.all(directories.map(async p => {
-      const root = await hostFS.realpath(absolutePath(p))
-      if (!(await hostFS.stat(root)).isDirectory()) throw problem(400, '扫描路径必须是目录')
-      return root
-    })))]
-    const [docker, native] = await Promise.all([discoverDocker(), discoverNative({ roots: canonicalRoots })])
-    const diagnostics = [...docker.diagnostics, ...native.diagnostics]
+    const directories = (!roots?.length ? this.roots : roots).map(absolutePath)
+    const diagnostics = []
+    // 宿主目录不可访问不应阻断独立的 Docker 发现。
+    const nativeDiscovery = async () => {
+      const canonicalRoots = []
+      for (const directory of directories) {
+        try {
+          const root = await hostFS.realpath(directory)
+          if (!(await hostFS.stat(root)).isDirectory()) throw problem(400, '扫描路径必须是目录')
+          if (!canonicalRoots.includes(root)) canonicalRoots.push(root)
+        } catch (error) {
+          console.warn('[发现] 宿主目录不可访问', { directory, code: error.code || error.status || 'unknown' })
+          diagnostics.push(`请检查宿主扫描目录：${directory}`)
+        }
+      }
+      return discoverNative({ roots: canonicalRoots })
+    }
+    const results = await Promise.allSettled([discoverDocker(), nativeDiscovery()])
+    const specs = []
+    for (const [index, result] of results.entries()) {
+      if (result.status === 'fulfilled') {
+        specs.push(...result.value.candidates)
+        diagnostics.push(...result.value.diagnostics)
+      } else {
+        const kind = index === 0 ? 'Docker' : '原生'
+        console.warn('[发现] 实例扫描失败', { kind, code: result.reason?.code || result.reason?.status || 'unknown' })
+        diagnostics.push(index === 0 ? '请检查 Docker 连接与访问权限' : '请检查宿主扫描目录与访问权限')
+      }
+    }
     const candidates = []
     const seen = new Set()
-    for (const spec of [...docker.candidates, ...native.candidates]) {
+    for (const spec of specs) {
       const id = targetId(spec)
       if (seen.has(id)) continue
       seen.add(id)
