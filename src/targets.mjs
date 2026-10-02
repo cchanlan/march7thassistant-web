@@ -7,6 +7,7 @@ import { discoverNative, inspectNative, stopNative, restoreNative, abandonNative
 import { processSnapshot } from './processes.mjs'
 import { absolutePath, hash, problem, readLocal, validateGameConfig, atomicJSON, writeLocal, fileIdentity, sameFile } from './io.mjs'
 import { MetadataStore, envOverrides } from './metadata.mjs'
+import { containerMode, hostFS, canControlHost } from './host.mjs'
 
 function targetId(spec) {
   return hash(spec.kind === 'docker' ? `docker:${spec.containerName}:${spec.containerConfigPath}` : `file:${spec.configPath}`).slice(0, 24)
@@ -61,11 +62,11 @@ export class Targets {
   async discover(roots, owner) {
     if (roots !== undefined && (!Array.isArray(roots) || roots.length > 8)) throw problem(400, '扫描目录最多填写 8 个')
     const directories = !roots?.length ? this.roots : roots
-    const canonicalRoots = [...new Set(directories.map(p => {
-      const root = fs.realpathSync(absolutePath(p))
-      if (!fs.statSync(root).isDirectory()) throw problem(400, '扫描路径必须是目录')
+    const canonicalRoots = [...new Set(await Promise.all(directories.map(async p => {
+      const root = await hostFS.realpath(absolutePath(p))
+      if (!(await hostFS.stat(root)).isDirectory()) throw problem(400, '扫描路径必须是目录')
       return root
-    }))]
+    })))]
     const [docker, native] = await Promise.all([discoverDocker(), discoverNative({ roots: canonicalRoots })])
     const diagnostics = [...docker.diagnostics, ...native.diagnostics]
     const candidates = []
@@ -105,7 +106,7 @@ export class Targets {
     }
     if (input.configLocation && input.configLocation !== 'host') throw problem(400, '配置路径类型不正确')
     let file
-    try { file = readLocal(absolutePath(input.configPath)) } catch (error) {
+    try { file = await readLocal(absolutePath(input.configPath)) } catch (error) {
       if (error.code === 'ENOENT') throw problem(400, '未找到配置文件，请填写服务器上的完整路径')
       if (['EACCES', 'EPERM'].includes(error.code)) throw problem(403, '面板用户没有读取该配置文件的权限')
       throw error
@@ -118,14 +119,14 @@ export class Targets {
     if (docker.candidates.length === 1) {
       return this.register({ ...docker.candidates[0], configPath: file.actual, fileOnly: input.fileOnly === true })
     }
-    const spec = { kind: 'native', configPath: file.actual, root: input.installDir ? fs.realpathSync(absolutePath(input.installDir)) : path.dirname(file.actual), label: path.basename(path.dirname(file.actual)), fileOnly: input.fileOnly === true }
+    const spec = { kind: 'native', configPath: file.actual, root: input.installDir ? await hostFS.realpath(absolutePath(input.installDir)) : path.dirname(file.actual), label: path.basename(path.dirname(file.actual)), fileOnly: input.fileOnly === true }
     const runtime = await inspectNative(spec)
     if (runtime.kind === 'file' && !spec.fileOnly) throw problem(400, '未确认程序安装目录，请补充安装目录或选择仅编辑文件模式')
     if (runtime.kind === 'file') { spec.kind = 'file'; spec.root = null }
     else {
       spec.root = runtime.root
       if (runtime.manager?.type === 'pm2') spec.managerHint = { type: 'pm2', id: runtime.manager.id, home: runtime.manager.home }
-      else if (runtime.manager?.type === 'systemd') spec.managerHint = { type: 'systemd', unit: runtime.manager.unit, user: !!runtime.manager.user }
+      else if (runtime.manager?.type === 'systemd') spec.managerHint = { type: 'systemd', unit: runtime.manager.unit, user: !!runtime.manager.user, uid: runtime.manager.uid ?? null }
     }
     return this.register(spec)
   }
@@ -133,7 +134,7 @@ export class Targets {
     const runtime = spec.kind === 'docker' ? await inspectDocker(spec) : await inspectNative(spec)
     if (!runtime.canRead) return runtime
     if (spec.kind !== 'docker') {
-      const local = readLocal(spec.configPath)
+      const local = await readLocal(spec.configPath)
       validateGameConfig(local.text)
       if (local.actual !== spec.configPath) throw problem(409, '配置路径已变化，请重新接入')
       runtime.configPath = local.actual
@@ -145,7 +146,7 @@ export class Targets {
       // 纯文件模式要求每次保存重新确认；已知运行中的程序不能绕过闸门。
       let writable = runtime.canWrite
       if (spec.kind !== 'docker') {
-        try { fs.accessSync(spec.configPath, fs.constants.W_OK); writable = true } catch { writable = false }
+        try { await hostFS.access(spec.configPath, fs.constants.W_OK); writable = true } catch { writable = false }
       }
       runtime.canWrite = writable && runtime.running !== true
       runtime.warnings = [...(runtime.warnings || []), '仅保存配置文件；保存前必须确认没有运行中的程序写入，应用方式由原部署决定']
@@ -172,13 +173,14 @@ export class Targets {
     let registered = false
     for (const record of this.records.values()) {
       if (record.id === targetId(spec) || record.spec.kind === 'docker' || !record.spec.configPath) continue
-      try { if (sameFile(identity, fileIdentity(record.spec.configPath))) registered = true }
+      try { if (sameFile(identity, await fileIdentity(record.spec.configPath))) registered = true }
       catch (error) {
         if (!['ENOENT', 'ENOTDIR'].includes(error.code)) return deny('请核对已连接实例的配置访问权限', '已连接配置身份不可用')
       }
     }
     if (others.length || docker.users.length || registered) return deny('请为每个实例配置独立文件后再保存', `共享配置：本机进程 ${others.length}，容器 ${docker.users.length}，其他连接 ${registered ? 1 : 0}`)
     if (!native.complete || !docker.complete) return deny(native.warnings[0] || docker.warnings[0] || '请核对其他部署后重新载入', '其他配置使用者无法完整核验')
+    if (containerMode && !canControlHost()) return deny('请核对上次保存的备份与实例状态，然后在部署目录执行 docker compose restart web', '宿主变更操作已锁定')
     return runtime
   }
   async bundle(id) {
@@ -187,7 +189,7 @@ export class Targets {
     if (!runtime.canRead) throw problem(503, '无法读取目标配置，请检查权限与运行环境')
     const metadata = await this.metadata.get(record.spec, runtime)
     runtime.warnings = [...(runtime.warnings || []), ...metadata.warnings]
-    const config = runtime.config || (runtime.kind === 'docker' ? await readDockerFile(runtime.containerId, runtime.containerConfigPath) : readLocal(record.spec.configPath))
+    const config = runtime.config || (runtime.kind === 'docker' ? await readDockerFile(runtime.containerId, runtime.containerConfigPath) : await readLocal(record.spec.configPath))
     const doc = validateGameConfig(config.text)
     const overrides = envOverrides(runtime.environment)
     if (runtime.environment === null) runtime.warnings.push('无法确认运行进程的环境变量，修改前请检查外部覆盖项')
@@ -209,6 +211,6 @@ export class Targets {
     if (fresh.binding !== bundle.binding || fresh.config.text !== bundle.config.text) throw problem(409, '配置文件已变化，请重新载入')
     if (!fresh.runtime.canWrite || fresh.runtime.running === true || (!fresh.runtime.fileOnly && fresh.runtime.running !== false)) throw problem(409, fresh.runtime.warnings?.[0] || '请确认实例已停止后再保存')
     if (fresh.runtime.kind === 'docker') await writeDockerFile(fresh.runtime, fresh.config, next)
-    else writeLocal(fresh.record.spec.configPath, fresh.config.text, next, fresh.runtime.configPath, fresh.config.identity)
+    else await writeLocal(fresh.record.spec.configPath, fresh.config.text, next, fresh.runtime.configPath, fresh.config.identity)
   }
 }

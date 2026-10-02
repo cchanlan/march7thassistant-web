@@ -1,0 +1,34 @@
+# 默认不发送任何文件，只开放镜像构建和运行必需内容。
+# .state、.env、账号配置、备份、测试、.git、.claude 和 node_modules 均不进入上下文。
+**
+!Dockerfile
+!.dockerignore
+!package.json
+!package-lock.json
+!server.mjs
+!LICENSE
+!metadata/
+!metadata/defaults.yaml
+!metadata/schema.json
+!public/
+!public/index.html
+!public/app.js
+!public/style.css
+!src/
+!src/auth.mjs
+!src/docker.mjs
+!src/host.mjs
+!src/io.mjs
+!src/metadata.mjs
+!src/native.mjs
+!src/processes.mjs
+!src/schema.mjs
+!src/targets.mjs
+!tools/
+!tools/reset-password.mjs
+!tools/host-bridge/
+!tools/host-bridge/bridge.c
+!tools/host-bridge/bridge.h
+!tools/host-bridge/control.c
+!tools/host-bridge/NOTICE
+!tools/host-bridge/LICENSE

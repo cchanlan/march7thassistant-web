@@ -1,0 +1,175 @@
+March7th Assistant host bridge
+==============================
+
+Purpose and build
+-----------------
+Node remains in the image. The helper is single-threaded C with disposable,
+single-threaded request workers; no shell and no network listener are provided.
+Build on Alpine (musl), not a glibc host. Verified with Alpine 3.22 x86_64,
+GCC 14.2, musl 1.2.5-r12 and json-c 0.18-r1:
+
+    apk add --no-cache build-base json-c-dev
+    cd tools/host-bridge
+    cc -std=c11 -O2 -Wall -Wextra -Werror -static \
+      bridge.c control.c -ljson-c -o m7a-host-bridge
+    ./m7a-host-bridge --version
+
+Alpine 3.22 json-c-dev includes libjson-c.a; there is no json-c-static package.
+The output must be statically linked and have no ELF PT_INTERP segment.
+Do not commit generated binaries or test fixtures. Other architectures must be
+built on the corresponding Alpine platform; arm64 was not tested here.
+
+Keep LICENSE (full GPL v3) and NOTICE (full json-c/musl notices and GCC runtime
+exception) with the distributed binary. The application and bridge source are
+GPL-3.0-only. Static-link notices are not replaced by SPDX comments or URLs.
+
+Runtime and authorization
+-------------------------
+M7A_CONTAINER=1 enables the bridge. It defaults off. The executable defaults to
+this directory's m7a-host-bridge, resolved relative to src/host.mjs; an absolute
+M7A_HOST_BRIDGE may select an installed binary. This is a trusted deployment
+setting, not a request parameter. M7A_HOST_UID is a canonical unsigned decimal
+UID below UINT32_MAX, default 0; native mode always uses process.getuid().
+
+Normal invocation takes no arguments and requires private parent stdio pipes.
+--version prints only the protocol version and never enters another namespace.
+There is deliberately no production test-root, arbitrary-exec or shell mode.
+
+Startup opens /proc/1's root and mount namespace, verifies that PID 1 and the
+helper share the PID namespace but have different mount/root identities, pins
+those descriptors, setns()es the mount namespace, then fchdir/chroot/chdir()s.
+It verifies the resulting namespace/root and the original Node parent identity.
+Unneeded inherited descriptors are closed before entering the host. No loader,
+credential or caller environment is forwarded to host commands.
+
+The initial JSON-line handshake includes the host scope and Node pid/startTime.
+Node independently verifies its process/proc identity and handshake shape.
+Reading may begin before authorization. The caller must complete the full
+Docker self-container proof before calling:
+
+    await authorizeHost({ pid: process.pid, startTime, scope: await getHostScope() })
+
+startTime is /proc/PID/stat field 22 as a decimal string. Scope is exactly:
+
+    { namespaces: { mount, pid }, rootIdentity: { dev, ino } }
+
+The helper rechecks the live parent, its original root/mount identity and scope.
+The bridge itself does not substitute for Docker container/cgroup/socket/UID-map
+self-identification. A fresh connection never inherits previous authorization.
+canControlHost() is false in container mode unless the current bridge is ready,
+authorized and has no unsafe write; native mode returns true.
+
+API
+---
+Exports from src/host.mjs:
+  containerMode, hostUid, hostFS
+  initializeHost(), getHostScope(), authorizeHost(identity), canControlHost()
+  closeHost()
+  readHostFile(path, limit = 4 * 1024 * 1024) -> UTF-8 text
+  hostFileIdentity(path) -> { actual, dev: string, ino: string }
+  readHostConfig(path) -> { text, actual, stat, identity }
+  writeHostConfig(file, original, next, expectedPath, expectedIdentity)
+  hostProcessFileIdentity(pid, file, expectedStartTime) -> file identity
+  hostSystemctl(args, timeout = 3500, uid = null) -> stdout string
+  hostPm2Request(daemon, buffer, timeout = 3500) -> Buffer
+
+hostFS has async realpath/stat/lstat/readlink/access/readdir/opendir. Stat values
+have Node's isFile/isDirectory/isSymbolicLink/isSocket/etc. methods; bigint
+stats include nanosecond timestamps. Birthtime is zero where unavailable.
+opendir returns an async-iterable directory with read()/close() promises.
+Directory enumeration is a bounded snapshot, not an unbounded streaming fd;
+recursive readdir is rejected. Paths are absolute UTF-8 paths (including spaces
+and non-BMP Unicode), not arbitrary non-UTF-8 byte names. Native hostFS is the
+unaltered node:fs/promises module. Native systemctl stays with the application's
+existing local command adapter; calling hostSystemctl natively is rejected.
+
+Ordinary-file readers and writers first pin with O_PATH, check the file type,
+and reopen the pinned inode through /proc. They never open devices merely to
+check their type. Configs are limited to 1 MiB. Writes retain the original fd,
+check canonical path/inode and original bytes, loop over partial pwrite/write,
+truncate and fsync. On normal failure the same fd is used to restore old bytes.
+External non-cooperating writers are not made transactional by advisory flock.
+
+All configuration-write failures conservatively mark unsafeToStart, including
+pre-write stale/busy rejection and an apparently successful rollback. An
+unacknowledged write, timeout, disconnect or close failure is never treated as
+success. The unsafe latch blocks ALL further mutations (stop, write and start),
+not just start, so another target cannot be stopped and left stranded. Reads
+continue. Reauthorizing or reconnecting does not clear Node's latch. Recovery
+requires a new Node process followed by complete self-identification; the caller
+must first inspect/repair the affected configuration. A worker killed while
+writing may leave partial bytes: no rollback is promised after SIGKILL, power
+loss, filesystem failure or an uninterruptible kernel syscall.
+
+Process-file identities use a verified target-process root and startTime before
+and after lookup. C performs chroot only in that disposable worker, preserving
+absolute symlink semantics. Native Node walks pinned directory fds, restarts at
+the process root for absolute links and clamps '..' at that root.
+
+Systemctl and PM2
+-----------------
+Only the closed systemctl argument grammar implemented in control.c is accepted:
+list-unit-files/show and start/stop, fixed safe options/properties, and service
+unit names. It executes a trusted root-owned
+host binary from fixed standard candidates with a fixed environment. There is
+no executable path, shell command, EnvironmentFile or arbitrary env parameter.
+Total arguments are limited to 64. stdout and stderr share a 4 MiB ceiling.
+User-manager operations require --user with an explicit valid UID, a matching
+passwd entry, a securely owned non-symlink runtime directory, its systemd
+directory and systemd/private socket. The child rechecks their identities after
+establishing the trusted groups/GID/UID. Both XDG_RUNTIME_DIR and the explicit
+DBUS_SESSION_BUS_ADDRESS point only to this verified manager endpoint; a separate
+session bus or dbus-user-session installation is not required or used.
+An externally verified target UID need not equal the catalog's hostUid.
+
+PM2 daemon input is { state: 'running', home, pid, uid, startTime, socketInode }.
+home/rpc.sock must be canonical, securely owned and a socket. The bridge checks
+the pathname inode around connect, daemon startTime and /proc listener ownership,
+and SO_PEERCRED pid/uid. socketInode is the kernel /proc/net/unix inode, not the
+filesystem lstat inode. Only getMonitorData({}), stopProcessId(integer) and
+startProcessId(integer) AMP requests are accepted. The validated request is
+re-encoded rather than forwarding arbitrary raw JSON. Responses are bounded,
+frame-checked and matched to the request id. Native Node, which has no public
+SO_PEERCRED API, retains /proc listener-inode/owning-fd proof plus canonical
+path/startTime checks; the C container path additionally enforces SO_PEERCRED.
+
+Resource and failure bounds
+---------------------------
+  JSON lines:                  16 MiB; depth 32 (AMP JSON depth 64)
+  Read/systemctl/PM2 response:  4 MiB
+  Config original/next:        1 MiB each, base64 on the private wire
+  PM2 request:                 4 KiB
+  Directory enumeration:      65,536 entries and a 4 MiB encoded budget
+  Node pending / C workers:   64 / 8
+  Handshake / partial line / blocked output: 5 seconds
+  Ordinary worker:             8 seconds + 750 ms supervisor allowance
+  API control timeout:         1..19,000 ms (caller defaults 3,500 ms)
+  Node control grace:          1,500 ms, covering worker cleanup/transport
+  Worker CPU / address space: 20 seconds / 256 MiB
+  Native PM2 fd scan:          16,384 entries and one whole-request deadline
+
+Each request runs in its own process group. The parent polls requests and worker
+pipes together; a blocked manager cannot indefinitely prevent independent reads
+or group cleanup. Completion, timeout and disconnect all kill the worker group.
+The expected parent PID is recorded before fork; PDEATHSIG setup checks prevent
+an already-orphaned worker from trusting its adopter. Active workers are not
+reaped before group termination, avoiding recycled-PID kills. EOF/parent death
+terminates the bridge; a Node transport failure rejects all pending requests.
+
+Messages contain results or fixed errors, never debug dumps of command arguments,
+environments or original file bytes. No output is written to a logger by this
+module. json-c 0.18 STRICT has a signed-char Unicode parsing issue; the shared
+parser independently validates UTF-8 and converts non-ASCII JSON bytes to Unicode
+escapes before strict parsing. It rejects overlong encodings, surrogates, values
+above U+10FFFF, embedded NULs and NUL-bearing object keys.
+
+Verification boundary
+---------------------
+Local verification used only synthetic files, artificial chroot roots, private
+pipe peers, fake Unix sockets and non-executing/fake systemctl programs. It
+covered strict static compilation, fd-preserving writes/rollback fault injection,
+Chinese paths, process-root symlinks, PM2 credentials/framing, 4 MiB replies,
+parent-death races, request matching and the unsafe latch. It did not run the
+production namespace-entry path against the real machine, access real service
+accounts or control existing containers. Real host namespace/Docker deployment
+validation belongs to an explicitly isolated integration environment.

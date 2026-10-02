@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { parseConfig } from './schema.mjs'
+import { containerMode, hostFileIdentity, readHostConfig, writeHostConfig } from './host.mjs'
 
 export const execute = promisify(execFile)
 export const hash = value => createHash('sha256').update(value).digest('hex')
@@ -21,7 +22,8 @@ function descriptorIdentity(fd, actual) {
   if (!stat.isFile()) throw problem(400, '请选择普通配置文件')
   return { actual, dev: String(stat.dev), ino: String(stat.ino) }
 }
-export function fileIdentity(file) {
+export async function fileIdentity(file) {
+  if (containerMode) return hostFileIdentity(absolutePath(file))
   const actual = fs.realpathSync(absolutePath(file))
   const fd = fs.openSync(actual, 'r')
   try { return descriptorIdentity(fd, actual) } finally { fs.closeSync(fd) }
@@ -29,7 +31,8 @@ export function fileIdentity(file) {
 export function sameFile(a, b) {
   return typeof a?.dev === 'string' && a.dev.length > 0 && typeof a.ino === 'string' && a.ino.length > 0 && !!b && a.dev === b.dev && a.ino === b.ino
 }
-export function readLocal(file) {
+export async function readLocal(file) {
+  if (containerMode) return readHostConfig(absolutePath(file))
   const requested = absolutePath(file)
   const actual = fs.realpathSync(requested)
   const fd = fs.openSync(actual, 'r')
@@ -61,7 +64,8 @@ export function atomicJSON(file, data) {
     try { fs.unlinkSync(temp) } catch (e) { if (e.code !== 'ENOENT') throw e }
   }
 }
-export function writeLocal(file, original, next, expectedPath, expectedIdentity) {
+export async function writeLocal(file, original, next, expectedPath, expectedIdentity) {
+  if (containerMode) return writeHostConfig(absolutePath(file), original, next, expectedPath, expectedIdentity)
   const actual = fs.realpathSync(absolutePath(file))
   if (actual !== expectedPath) throw problem(409, '配置路径已变化，请重新接入')
   const fd = fs.openSync(actual, fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW || 0))
@@ -75,7 +79,7 @@ export function writeLocal(file, original, next, expectedPath, expectedIdentity)
   let touched = false
   try {
     const identity = descriptorIdentity(fd, actual)
-    if ((expectedIdentity && !sameFile(identity, expectedIdentity)) || !sameFile(identity, fileIdentity(file)) || fs.readFileSync(fd, 'utf8') !== original) throw problem(409, '配置文件已变化，请重新载入')
+    if ((expectedIdentity && !sameFile(identity, expectedIdentity)) || !sameFile(identity, await fileIdentity(file)) || fs.readFileSync(fd, 'utf8') !== original) throw problem(409, '配置文件已变化，请重新载入')
     // 保留 inode，兼容单文件挂载；必须先核验实际打开的文件身份。
     touched = true
     write(next)

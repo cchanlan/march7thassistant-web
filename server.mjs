@@ -8,6 +8,8 @@ import { AuthStore, validatePassword } from './src/auth.mjs'
 import { Targets, publicRuntime } from './src/targets.mjs'
 import { problem } from './src/io.mjs'
 import { same } from './src/schema.mjs'
+import { containerMode, initializeHost, closeHost } from './src/host.mjs'
+import { verifyContainerHost } from './src/docker.mjs'
 
 if (process.platform !== 'linux') throw new Error('本项目目前仅支持 Linux')
 const root = fileURLToPath(new URL('.', import.meta.url))
@@ -21,10 +23,20 @@ const auth = new AuthStore(stateDir, { initialize: true })
 const targets = new Targets(stateDir, process.env.M7A_SEARCH_ROOTS?.split(path.delimiter).filter(Boolean))
 const backups = path.join(stateDir, 'backups')
 fs.mkdirSync(backups, { recursive: true, mode: 0o700 })
+if (containerMode) {
+  try {
+    await initializeHost()
+    await verifyContainerHost()
+    console.log('[宿主桥接] 已核验容器与宿主身份')
+  } catch (error) {
+    console.error('[宿主桥接] 初始化未完成，宿主操作保持禁用', error.code || error.status || 'unknown')
+  }
+}
 const sessions = new Map(), attempts = new Map()
 const SESSION_MS = 12 * 60 * 60 * 1000
 const allowedHosts = new Set(['localhost', '127.0.0.1', '[::1]', ...Object.values(os.networkInterfaces()).flat().filter(Boolean).map(i => i.address.includes(':') ? `[${i.address}]` : i.address)])
-let saving = false, changingPassword = false, discovering = false, authInFlight = 0
+let saving = false, changingPassword = false, discovering = false, authInFlight = 0, shuttingDown = false
+let inFlight = 0, connectionsClosed = false, closingBridge = false
 const staticFiles = new Map([['/', ['index.html', 'text/html']], ['/app.js', ['app.js', 'text/javascript']], ['/style.css', ['style.css', 'text/css']]])
 function json(res, status, data) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(data)) }
 async function body(req) {
@@ -131,10 +143,12 @@ async function saveConfig(payload, session) {
 }
 
 const server = http.createServer(async (req, res) => {
+  inFlight++
   res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer'); res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
   try {
     verifyRequest(req)
+    if (shuttingDown) throw problem(503, '面板正在退出，请稍后再试')
     const url = new URL(req.url, 'http://localhost'); const route = url.pathname; const session = sessionFor(req)
     if (req.method === 'GET' && staticFiles.has(route)) { const [file, type] = staticFiles.get(route); res.writeHead(200, { 'Content-Type': `${type}; charset=utf-8` }); return res.end(fs.readFileSync(path.join(root, 'public', file))) }
     if (req.method === 'GET' && route === '/api/session') return json(res, 200, { authenticated: !!session, csrf: session?.csrf })
@@ -209,13 +223,16 @@ const server = http.createServer(async (req, res) => {
   } catch (error) {
     if (!error.status) console.error('[请求]', error.code || error.name || 'failed')
     if (!res.headersSent) json(res, error.status || 500, { error: error.status ? error.message : '操作未完成，请检查路径、权限与服务日志' }); else res.end()
+  } finally {
+    inFlight--
+    void finishShutdown()
   }
 })
 server.requestTimeout = 180000; server.headersTimeout = 15000
-server.on('error', error => { console.error('[启动]', error.code); process.exitCode = 1 })
+server.on('error', async error => { console.error('[启动]', error.code); process.exitCode = 1; await closeHost() })
 server.listen(port, host, () => {
   console.log(`三月七 Linux 配置面板已启动：${host}:${port}`)
-  if (auth.initialCreated) console.log('初始密码领取文件：.state/access.txt；不要把领取文件当作密码配置')
+  if (auth.initialCreated) console.log(`初始密码领取文件：${path.join(stateDir, 'access.txt')}；不要把领取文件当作密码配置`)
   console.log('忘记密码：在面板目录运行 node tools/reset-password.mjs')
 })
 setInterval(() => {
@@ -223,5 +240,16 @@ setInterval(() => {
   for (const [id, session] of sessions) if (session.expires < now) sessions.delete(id)
   for (const [key, attempt] of attempts) if (attempt.until < now) attempts.delete(key)
 }, 60000).unref()
-function shutdown() { server.close(() => process.exit(0)) }
+async function finishShutdown() {
+  if (!shuttingDown || !connectionsClosed || inFlight || closingBridge) return
+  closingBridge = true
+  try { await closeHost() } finally { process.exit(0) }
+}
+function shutdown() {
+  if (shuttingDown) return
+  shuttingDown = true
+  // A disconnected browser does not mean its asynchronous save/restore has finished.
+  server.close(() => { connectionsClosed = true; void finishShutdown() })
+  server.closeIdleConnections?.()
+}
 process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown)

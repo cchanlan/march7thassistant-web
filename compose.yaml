@@ -1,0 +1,54 @@
+name: march7th-web
+
+services:
+  web:
+    image: ${M7A_IMAGE:-ghcr.io/cchanlan/march7thassistant-web:latest}
+    platform: linux/amd64
+    restart: unless-stopped
+    user: "0:0"
+    # 完整宿主管理模式：仅支持本机 Linux rootful Docker。
+    # 不要添加 init/tini 或覆盖 entrypoint；容器主进程必须是 Node。
+    pid: host
+    cgroup: host
+    network_mode: host
+    stop_grace_period: 3m
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN
+      - SYS_CHROOT
+      - SYS_PTRACE
+      - DAC_READ_SEARCH
+      - DAC_OVERRIDE
+      - SETUID
+      - SETGID
+      - KILL
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    environment:
+      NODE_ENV: production
+      HOST: ${HOST:-127.0.0.1}
+      PORT: "${PORT:-18077}"
+      M7A_CONTAINER: "1"
+      M7A_HOST_BRIDGE: /usr/local/bin/m7a-host-bridge
+      M7A_STATE_DIR: /var/lib/march7th-web
+      # 以下路径均指宿主，不是容器里的同名目录。
+      M7A_SEARCH_ROOTS: ${M7A_SEARCH_ROOTS:-/root}
+      PM2_HOME: ${PM2_HOME:-/root/.pm2}
+      M7A_HOST_UID: "${M7A_HOST_UID:-0}"
+      M7A_PUBLIC_ORIGIN: ${M7A_PUBLIC_ORIGIN:-}
+      M7A_READ_ONLY: "${M7A_READ_ONLY:-0}"
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
+      - type: volume
+        source: state
+        target: /var/lib/march7th-web
+
+# 不绑定原生部署的 .state；每个 Compose project 使用自己的状态卷。
+volumes:
+  state:

@@ -1,4 +1,4 @@
-import fs from 'node:fs/promises'
+import { containerMode, hostFS as fs, hostUid, readHostFile } from './host.mjs'
 import { constants } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -105,7 +105,7 @@ async function projectAt(directory) {
     try {
       const module = await regular(path.join(root, CONFIG_MODULE), root)
       if (module) {
-        const literal = parseConfigPath(await readLimited(module.path, 524288))
+        const literal = parseConfigPath(await readHostFile(module.path, 524288))
         markers.push(module.stamp)
         const target = literal ? path.resolve(root, literal) : null
         if (target && within(root, target)) {
@@ -121,11 +121,13 @@ async function projectAt(directory) {
 const hasFileIdentity = value => typeof value?.dev === 'string' && value.dev.length > 0 && typeof value.ino === 'string' && value.ino.length > 0
 
 // null means insufficient scope metadata, not a foreign process that can be skipped.
-function localProcess(proc, observer) {
-  for (const scope of [proc, observer]) {
+function localProcess(proc, hostScope) {
+  for (const scope of [proc, hostScope]) {
     if (typeof scope?.namespaces?.mount !== 'string' || !scope.namespaces.mount || typeof scope.namespaces.pid !== 'string' || !scope.namespaces.pid || !hasFileIdentity(scope.rootIdentity)) return null
   }
-  return proc.namespaces.mount === observer.namespaces.mount && sameFile(proc.rootIdentity, observer.rootIdentity)
+  // PID-only isolation does not change filesystem paths: such a process can
+  // still share the host config. Only mount/root establish the path boundary.
+  return proc.namespaces.mount === hostScope.namespaces.mount && sameFile(proc.rootIdentity, hostScope.rootIdentity)
 }
 
 /** Read-only use detection is deliberately broader than projectAt's management boundary. */
@@ -135,7 +137,7 @@ export async function observeNativeConfigUsers(identity, snapshot) {
   const uncertain = message => { complete = false; warnings.push(message) }
   const finish = () => ({ users: users.sort((a, b) => a.pid - b.pid || a.root.localeCompare(b.root)), complete, warnings: [...new Set(warnings)] })
   if (!complete) uncertain('进程快照不完整，无法排除其他配置使用者')
-  if (process.platform !== 'linux' || !Array.isArray(snapshot?.processes) || localProcess(snapshot.observer, snapshot.observer) !== true) {
+  if (process.platform !== 'linux' || !Array.isArray(snapshot?.processes) || localProcess(snapshot.hostScope, snapshot.hostScope) !== true) {
     uncertain('无法核验本机进程的命名空间'); return finish()
   }
   if (typeof identity?.actual !== 'string' || !path.isAbsolute(identity.actual) || !hasFileIdentity(identity)) {
@@ -167,7 +169,7 @@ export async function observeNativeConfigUsers(identity, snapshot) {
         // are ineligible for management but can still be in active use.
         const module = await regular(path.join(root, CONFIG_MODULE))
         if (!module) return null
-        const literal = parseConfigPath(await readLimited(module.path, 524288))
+        const literal = parseConfigPath(await readHostFile(module.path, 524288))
         const after = await regular(path.join(root, CONFIG_MODULE))
         if (!literal || !after || digest(module.stamp) !== digest(after.stamp)) return null
         return { project, literal }
@@ -176,7 +178,7 @@ export async function observeNativeConfigUsers(identity, snapshot) {
     return projects.get(root)
   }
   for (const proc of snapshot.processes) {
-    const local = localProcess(proc, snapshot.observer)
+    const local = localProcess(proc, snapshot.hostScope)
     if (local === false) continue // Container/chroot paths must not be resolved against the host.
     if (local === null || !Number.isSafeInteger(proc.pid) || proc.pid <= 0 || typeof proc.startTime !== 'string' || !/^\d+$/.test(proc.startTime) || !Array.isArray(proc.argv) || !proc.argv.length || proc.argv.some(part => typeof part !== 'string') || typeof proc.cwd !== 'string' || !path.isAbsolute(proc.cwd)) {
       uncertain('部分进程身份无法完整核验'); continue
@@ -237,7 +239,7 @@ async function invocationMatches(argv, cwd, project) {
 async function appProcesses(project, snapshot) {
   const direct = [], suspicious = []
   for (const proc of snapshot.processes) {
-    const local = localProcess(proc, snapshot.observer)
+    const local = localProcess(proc, snapshot.hostScope)
     if (local !== true) { if (local === null) suspicious.push(proc); continue }
     if (await invocationMatches(proc.argv, proc.cwd, project)) { direct.push(proc); continue }
     const invocation = scriptInvocation(proc.argv)
@@ -253,7 +255,7 @@ async function appProcesses(project, snapshot) {
   let grew = true
   while (grew) {
     grew = false
-    for (const proc of snapshot.processes) if (localProcess(proc, snapshot.observer) === true && !pids.has(proc.pid) && pids.has(proc.ppid)) { pids.add(proc.pid); related.push(proc); grew = true }
+    for (const proc of snapshot.processes) if (localProcess(proc, snapshot.hostScope) === true && !pids.has(proc.pid) && pids.has(proc.ppid)) { pids.add(proc.pid); related.push(proc); grew = true }
   }
   return { direct, related, suspicious: suspicious.filter(proc => !pids.has(proc.pid)) }
 }
@@ -317,7 +319,7 @@ async function pm2Context(home) {
     } catch { return { daemon, entries: [], source: 'unknown', warning: '无法读取已运行 PM2 的完整清单' } }
   }
   try {
-    const list = JSON.parse(await readLimited(path.join(home, 'dump.pm2')))
+    const list = JSON.parse(await readHostFile(path.join(home, 'dump.pm2')))
     if (!Array.isArray(list) || list.length > 4096) throw failure('unknown', 'PM2 快照不完整')
     return { daemon, entries: list.map(pm2Entry).filter(Boolean), source: 'dump', warning: 'PM2 保存清单只作发现依据，不能代表当前运行状态' }
   } catch (error) {
@@ -332,9 +334,19 @@ const UNIT_PROPERTIES = [
   'Environment', 'EnvironmentFiles', 'KillMode', 'OnSuccess', 'OnFailure'
 ]
 function systemArgs(user) { return ['--no-ask-password', '--no-pager', ...(user ? ['--user'] : [])] }
-function parseUnitMetadata(text, user = false) {
+function systemHint(hint) {
+  if (!validUnit(hint?.unit) || typeof hint.user !== 'boolean') return null
+  // Legacy user hints bind to this deployment's configured manager, never an
+  // arbitrary account inferred from a directory or from the image's environment.
+  const uid = hint.user ? (hint.uid === undefined ? hostUid : hint.uid) : null
+  if (hint.user && (!Number.isSafeInteger(uid) || uid < 0 || uid >= 0xffffffff || (!containerMode && uid !== hostUid))) return null
+  if (!hint.user && hint.uid != null) return null
+  return { type: 'systemd', unit: hint.unit, user: hint.user, uid }
+}
+const unitKey = unit => JSON.stringify([unit.user, unit.user ? unit.uid : null, unit.unit || unit.Id])
+function parseUnitMetadata(text, user = false, uid = null) {
   return text.trim().split(/\n\s*\n/).map(block => {
-    const result = { user }
+    const result = { user, uid: user ? uid : null }
     for (const line of block.split('\n')) {
       const split = line.indexOf('=')
       const key = line.slice(0, split)
@@ -348,29 +360,32 @@ function parseUnitMetadata(text, user = false) {
   }).filter(item => validUnit(item.Id))
 }
 async function getUnit(hint) {
-  if (!validUnit(hint?.unit) || typeof hint.user !== 'boolean') return null
+  const manager = systemHint(hint)
+  if (!manager) return null
   try {
-    const output = await command('systemctl', [...systemArgs(hint.user), 'show', `--property=${UNIT_PROPERTIES.join(',')}`, '--', hint.unit])
-    return parseUnitMetadata(output, hint.user).find(unit => unit.Id === hint.unit) || null
+    const output = await command('systemctl', [...systemArgs(manager.user), 'show', `--property=${UNIT_PROPERTIES.join(',')}`, '--', manager.unit], 3500, manager.uid)
+    return parseUnitMetadata(output, manager.user, manager.uid).find(unit => unit.Id === manager.unit) || null
   } catch { return null }
 }
 async function unitCatalog(roots = []) {
   const units = [], warnings = []
   const deadline = Date.now() + 7000
-  for (const user of [false, true]) {
+  // Discover only the system manager and one explicitly configured user manager.
+  // Running app cgroups may identify another exact user unit; never enumerate users.
+  for (const { user, uid } of [{ user: false, uid: null }, { user: true, uid: hostUid }]) {
     if (Date.now() >= deadline) { warnings.push('systemd 发现达到时间上限'); break }
     try {
-      const output = await command('systemctl', [...systemArgs(user), 'list-unit-files', '--type=service', '--no-legend', '--plain'], Math.max(100, Math.min(2000, deadline - Date.now())))
+      const output = await command('systemctl', [...systemArgs(user), 'list-unit-files', '--type=service', '--no-legend', '--plain'], Math.max(100, Math.min(2000, deadline - Date.now())), uid)
       const names = [...new Set(output.split('\n').map(line => line.trim().split(/\s+/)[0]).filter(validUnit))]
       if (names.length > 200) warnings.push('systemd 单元数量超过发现上限，未扫描项保持未知')
       for (let offset = 0; offset < Math.min(names.length, 200); offset += 40) {
         if (Date.now() >= deadline) { warnings.push('systemd 发现达到时间上限'); break }
         // 先用最小元数据按安装目录筛选，不读取无关服务的环境和钩子配置。
-        const basic = await command('systemctl', [...systemArgs(user), 'show', '--property=Id,WorkingDirectory,ExecStart', '--', ...names.slice(offset, Math.min(offset + 40, 200))], Math.max(100, Math.min(2000, deadline - Date.now())))
-        const relevant = parseUnitMetadata(basic, user).filter(unit => path.isAbsolute(unit.WorkingDirectory || '') && roots.includes(path.resolve(unit.WorkingDirectory))).map(unit => unit.Id)
+        const basic = await command('systemctl', [...systemArgs(user), 'show', '--property=Id,WorkingDirectory', '--', ...names.slice(offset, Math.min(offset + 40, 200))], Math.max(100, Math.min(2000, deadline - Date.now())), uid)
+        const relevant = parseUnitMetadata(basic, user, uid).filter(unit => path.isAbsolute(unit.WorkingDirectory || '') && roots.includes(path.resolve(unit.WorkingDirectory))).map(unit => unit.Id)
         if (!relevant.length) continue
-        const detail = await command('systemctl', [...systemArgs(user), 'show', `--property=${UNIT_PROPERTIES.join(',')}`, '--', ...relevant], Math.max(100, Math.min(2000, deadline - Date.now())))
-        units.push(...parseUnitMetadata(detail, user))
+        const detail = await command('systemctl', [...systemArgs(user), 'show', `--property=${UNIT_PROPERTIES.join(',')}`, '--', ...relevant], Math.max(100, Math.min(2000, deadline - Date.now())), uid)
+        units.push(...parseUnitMetadata(detail, user, uid))
       }
     } catch { /* No bus/permissions is not evidence that a particular application stopped. */ }
   }
@@ -401,7 +416,7 @@ function unitEnvironment(unit) {
   return filterEnvironment(values)
 }
 function unitFingerprint(unit) {
-  return digest([unit.Id, unit.user, unit.WorkingDirectory, unitInvocation(unit), unit.FragmentPath, unit.DropInPaths,
+  return digest([unit.Id, unit.user, unit.uid, unit.WorkingDirectory, unitInvocation(unit), unit.FragmentPath, unit.DropInPaths,
     ...UNIT_PROPERTIES.filter(key => !['Id', 'WorkingDirectory', 'ExecStart', 'FragmentPath', 'DropInPaths', 'MainPID', 'ControlPID', 'InvocationID', 'ActiveState', 'SubState'].includes(key)).map(key => [key, unit[key]])])
 }
 function unitControllable(unit) {
@@ -428,7 +443,7 @@ async function managersFor(project, snapshot, apps, hint, pm2, catalog) {
     }
     const leader = snapshot.processes.find(proc => proc.pid === entry.pid)
     const descendants = apps.direct.filter(proc => belongsTo(proc, entry.pid, snapshot))
-    const live = entry.status === 'online' && leader && descendants.length && await invocationMatches(leader.argv, leader.cwd, project)
+    const live = entry.status === 'online' && leader && localProcess(leader, snapshot.hostScope) === true && descendants.length && await invocationMatches(leader.argv, leader.cwd, project)
     const stopped = entry.status === 'stopped' && !entry.pid
     if (!live && !stopped) { uncertain = true; continue }
     const controllable = !entry.automatic && Number.isFinite(entry.created)
@@ -439,35 +454,40 @@ async function managersFor(project, snapshot, apps, hint, pm2, catalog) {
       instance: live ? `${leader.pid}:${leader.startTime}` : null })
   }
   const unitHints = new Map()
-  if (hint?.type === 'systemd') unitHints.set(`${hint.user}:${hint.unit}`, hint)
+  const requestedUnit = hint?.type === 'systemd' ? systemHint(hint) : null
+  if (requestedUnit) unitHints.set(unitKey(requestedUnit), requestedUnit)
   for (const proc of apps.direct) {
     const owner = unitFromCgroup(proc.cgroup)
-    if (owner) unitHints.set(`${owner.user}:${owner.unit}`, owner)
+    if (owner) {
+      const scoped = systemHint(owner)
+      if (scoped) unitHints.set(unitKey(scoped), scoped)
+      else { uncertain = true; warnings.push('目标属于无法核验的用户管理器，仅提供只读状态') }
+    }
   }
   const units = [...(catalog?.units || [])]
   for (const [key, unitHint] of unitHints) {
-    if (!units.some(unit => `${unit.user}:${unit.Id}` === key)) {
+    if (!units.some(unit => unitKey(unit) === key)) {
       const unit = await getUnit(unitHint)
       if (unit) units.push(unit)
-      else if (hint?.type === 'systemd' && key === `${hint.user}:${hint.unit}`) uncertain = true
+      else if (requestedUnit && key === unitKey(requestedUnit)) uncertain = true
     }
   }
   let matchedHint = false
   for (const unit of units) {
     if (!await unitMatches(unit, project)) continue
-    if (hint?.type === 'systemd' && unit.Id === hint.unit && unit.user === hint.user) matchedHint = true
+    if (requestedUnit && unitKey(unit) === unitKey(requestedUnit)) matchedHint = true
     const pid = Number(unit.MainPID)
     const leader = snapshot.processes.find(proc => proc.pid === pid)
     const descendants = apps.direct.filter(proc => belongsTo(proc, pid, snapshot) && (() => {
       const owner = unitFromCgroup(proc.cgroup)
-      return owner?.unit === unit.Id && owner.user === unit.user
+      return owner && unitKey(owner) === unitKey(unit)
     })())
-    const live = unit.ActiveState === 'active' && leader && descendants.length && await invocationMatches(leader.argv, leader.cwd, project)
+    const live = unit.ActiveState === 'active' && leader && localProcess(leader, snapshot.hostScope) === true && descendants.length && await invocationMatches(leader.argv, leader.cwd, project)
     const stopped = ['inactive', 'failed'].includes(unit.ActiveState) && !pid && !Number(unit.ControlPID)
     if (!live && !stopped) { uncertain = true; continue }
     const controllable = unitControllable(unit) && (!live || Boolean(unit.InvocationID))
     if (!controllable) warnings.push('systemd 目标不满足受限生命周期条件，仅提供只读状态')
-    candidates.push({ type: 'systemd', unit: unit.Id, user: unit.user, fingerprint: unitFingerprint(unit), pid,
+    candidates.push({ type: 'systemd', unit: unit.Id, user: unit.user, uid: unit.uid, fingerprint: unitFingerprint(unit), pid,
       state: live ? 'running' : 'stopped', controllable, invocation: unit.InvocationID || '', environment: unitEnvironment(unit),
       covers: apps.related.filter(proc => belongsTo(proc, pid, snapshot)).map(proc => proc.pid),
       instance: live ? `${leader.pid}:${leader.startTime}` : null })
@@ -485,15 +505,15 @@ function managerView(manager) {
   if (!manager) return null
   return manager.type === 'pm2'
     ? { type: 'pm2', id: manager.id, home: manager.home, verified: true, controllable: manager.controllable }
-    : { type: 'systemd', unit: manager.unit, user: manager.user, verified: true, controllable: manager.controllable }
+    : { type: 'systemd', unit: manager.unit, user: manager.user, uid: manager.uid, verified: true, controllable: manager.controllable }
 }
 function managerKey(manager) {
   if (!manager) return null
   return manager.type === 'pm2' ? digest([manager.type, manager.home, manager.id, manager.fingerprint, manager.daemon.pid, manager.daemon.startTime, manager.daemon.socketInode])
-    : digest([manager.type, manager.unit, manager.user, manager.fingerprint])
+    : digest([manager.type, manager.unit, manager.user, manager.uid, manager.fingerprint])
 }
 function managerHint(manager) {
-  return manager.type === 'pm2' ? { type: 'pm2', id: manager.id, home: manager.home } : { type: 'systemd', unit: manager.unit, user: manager.user }
+  return manager.type === 'pm2' ? { type: 'pm2', id: manager.id, home: manager.home } : { type: 'systemd', unit: manager.unit, user: manager.user, uid: manager.uid }
 }
 
 /** Bounded Linux discovery. All filesystem traversal stays within canonical caller roots. */
@@ -650,7 +670,7 @@ async function validateDefinition(saved) {
 }
 async function control(manager, action) {
   if (manager.type === 'pm2') return pm2Call(manager.daemon, action === 'stop' ? 'stopProcessId' : 'startProcessId', manager.id)
-  if (manager.type === 'systemd' && validUnit(manager.unit)) return command('systemctl', [...systemArgs(manager.user), action === 'stop' ? 'stop' : 'start', '--', manager.unit], 15000)
+  if (manager.type === 'systemd' && systemHint(manager)) return command('systemctl', [...systemArgs(manager.user), action === 'stop' ? 'stop' : 'start', '--', manager.unit], 15000, manager.uid)
   throw failure('forbidden', '没有可用的受限管理目标')
 }
 async function waitState(saved, running, timeout = 15000) {
@@ -696,7 +716,8 @@ export async function stopNative(runtime) {
       if (!proc || proc.startTime !== previous.startTime) throw failure('identity-changed', '进程身份已变化')
     }
   } catch (error) { activeOperations.delete(key); throw error }
-  const token = Object.freeze({ kind: 'native', id: randomBytes(24).toString('hex'), identity: saved.identity })
+  const token = Object.freeze({ kind: 'native', id: randomBytes(24).toString('hex'), identity: saved.identity,
+    ...(saved.manager.type === 'systemd' ? { uid: saved.manager.uid } : {}) })
   const record = { saved, key, phase: 'stopping', busy: false }
   restores.set(token, record)
   try {

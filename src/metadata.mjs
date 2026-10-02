@@ -42,9 +42,9 @@ export class MetadataStore {
         version = runtime.version
         try { instanceText = (await readDockerFile(runtime.containerId, path.posix.join(runtime.root, 'assets/config/instance_names.json'))).text } catch { /* 下面统一降级为只读副本设置。 */ }
       } else {
-        defaults = readLocal(path.join(runtime.root, 'assets/config/config.example.yaml')).text
-        version = readLocal(path.join(runtime.root, 'assets/config/version.txt')).text.trim()
-        try { instanceText = readLocal(path.join(runtime.root, 'assets/config/instance_names.json')).text } catch {}
+        defaults = (await readLocal(path.join(runtime.root, 'assets/config/config.example.yaml'))).text
+        version = (await readLocal(path.join(runtime.root, 'assets/config/version.txt'))).text.trim()
+        try { instanceText = (await readLocal(path.join(runtime.root, 'assets/config/instance_names.json'))).text } catch {}
       }
     } catch { throw problem(503, '无法读取当前程序的字段定义，请检查安装目录权限') }
     if (typeof version !== 'string' || version.length > 100 || /[\r\n\0]/.test(version)) throw problem(400, '程序版本信息不正确')

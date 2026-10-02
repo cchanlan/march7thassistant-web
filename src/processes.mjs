@@ -3,6 +3,7 @@ import path from 'node:path'
 import net from 'node:net'
 import { execFile } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
+import { containerMode, getHostScope, hostFS, hostPm2Request, hostSystemctl, readHostFile } from './host.mjs'
 
 const PROC = '/proc'
 const LIMIT = 4 * 1024 * 1024
@@ -15,7 +16,15 @@ export function failure(kind, message) {
 }
 
 // Never put command output, argv, environment or manager error messages in an exception.
-export function command(file, args, timeout = 3500) {
+export function command(file, args, timeout = 3500, uid = null) {
+  if (containerMode && file === 'systemctl') {
+    return hostSystemctl(args, timeout, uid).catch(() => { throw failure('manager-unavailable', '无法核验管理器状态') })
+  }
+  // Direct installs may only address their own existing user manager. Never use
+  // sudo/runuser or forward an arbitrary command into the host namespace.
+  if (uid !== null && (file !== 'systemctl' || uid !== process.getuid?.() || !args.includes('--user'))) {
+    return Promise.reject(failure('forbidden', '无法核验指定用户管理器'))
+  }
   return new Promise((resolve, reject) => {
     execFile(file, args, { shell: false, timeout, killSignal: 'SIGKILL', maxBuffer: LIMIT, encoding: 'utf8', windowsHide: true }, (error, stdout) => {
       if (error) reject(failure('manager-unavailable', '无法核验管理器状态'))
@@ -78,13 +87,13 @@ export async function processAt(pid) {
     const last = parseProcStat(await readLimited(`${PROC}/${pid}/stat`, 8192))
     if (last.pid !== pid || first.startTime !== last.startTime || last.state === 'Z' || last.state === 'X') return null
     return { ...last, argv, cwd, cgroup, uid: owner.uid, ...scope }
-  } catch (error) {
-    if (error.code === 'ENOENT' || error.code === 'ESRCH') {
-      try {
-        const state = parseProcStat(await readLimited(`${PROC}/${pid}/stat`, 8192)).state
-        if (state === 'Z' || state === 'X') return null
-      } catch (next) { if (next.code === 'ENOENT' || next.code === 'ESRCH') return null }
-    }
+  } catch {
+    // Exiting processes can lose cmdline/cwd before /proc disappears. Drop them
+    // only when a final stat proves they are gone or zombies; live unknowns deny.
+    try {
+      const state = parseProcStat(await readLimited(`${PROC}/${pid}/stat`, 8192)).state
+      if (state === 'Z' || state === 'X') return null
+    } catch (next) { if (next.code === 'ENOENT' || next.code === 'ESRCH') return null }
     throw failure('unknown', '无法读取完整进程元数据')
   }
 }
@@ -93,8 +102,16 @@ export async function processSnapshot({ timeout = 4000, maxProcesses = 16384 } =
   const processes = [], warnings = []
   let complete = true
   let observer = { namespaces: null, rootIdentity: null }
+  let hostScope = { namespaces: null, rootIdentity: null }
   const until = Date.now() + timeout
   try { observer = await processScope('self') } catch { complete = false }
+  try {
+    hostScope = await getHostScope()
+    if (typeof hostScope?.namespaces?.mount !== 'string' || !hostScope.namespaces.mount || typeof hostScope.namespaces.pid !== 'string' || !hostScope.namespaces.pid
+      || typeof hostScope.rootIdentity?.dev !== 'string' || !hostScope.rootIdentity.dev || typeof hostScope.rootIdentity.ino !== 'string' || !hostScope.rootIdentity.ino) throw new Error()
+    // host PID sharing is required even though the observer keeps its own mount namespace.
+    if (observer.namespaces?.pid !== hostScope.namespaces.pid) complete = false
+  } catch { hostScope = { namespaces: null, rootIdentity: null }; complete = false }
   try {
     const mounts = await readLimited(`${PROC}/self/mountinfo`, 262144)
     const procMount = mounts.split('\n').find(line => line.split(' ')[4] === PROC)
@@ -116,7 +133,7 @@ export async function processSnapshot({ timeout = 4000, maxProcesses = 16384 } =
     }))
   } catch { complete = false }
   if (!complete) warnings.push('进程可见性不足或扫描达到上限，不能确认应用已停止')
-  return { observer, processes, complete, warnings }
+  return { observer, hostScope, processes, complete, warnings }
 }
 
 export const isPython = executable => /^(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)$/.test(path.basename(executable || ''))
@@ -159,8 +176,13 @@ export function unitFromCgroup(cgroup) {
     const units = location.split('/').filter(part => validUnit(part) && !/^user@\d+\.service$/.test(part))
     if (!units.length) continue
     const unit = units[units.length - 1]
-    const user = /\/user\.slice\/user-\d+\.slice\/user@\d+\.service\//.test(location)
-    if (user || location.startsWith('/system.slice/')) return { type: 'systemd', unit, user, cgroup: location }
+    const userScope = /\/user\.slice\/user-(\d+)\.slice\/user@(\d+)\.service\//.exec(location)
+    if (userScope) {
+      const uid = Number(userScope[1])
+      if (userScope[1] !== userScope[2] || !Number.isSafeInteger(uid) || uid < 0 || uid >= 0xffffffff) return null
+      return { type: 'systemd', unit, user: true, uid, cgroup: location }
+    }
+    if (location.startsWith('/system.slice/')) return { type: 'systemd', unit, user: false, uid: null, cgroup: location }
   }
   return null
 }
@@ -168,18 +190,22 @@ export const validUnit = unit => typeof unit === 'string' && /^[A-Za-z0-9][A-Za-
 
 export async function pm2Daemon(home) {
   try {
-    const canonical = await fs.realpath(home)
-    const pidText = (await readLimited(path.join(canonical, 'pm2.pid'), 64)).trim()
+    const canonical = await hostFS.realpath(home)
+    const pidText = (await readHostFile(path.join(canonical, 'pm2.pid'), 64)).trim()
     if (!/^\d+$/.test(pidText)) return { state: 'unknown' }
     const pid = Number(pidText)
     const proc = await processAt(pid)
     if (!proc) return { state: 'absent', home: canonical }
     const title = proc.argv.join(' ')
     const match = /^PM2 v[\w.+-]+: God Daemon \((.+)\)$/.exec(title)
-    if (!match || await fs.realpath(match[1]) !== canonical) return { state: 'unknown', home: canonical }
+    if (!match || await hostFS.realpath(match[1]) !== canonical) return { state: 'unknown', home: canonical }
+    const scope = await getHostScope()
+    if (!scope?.namespaces?.mount || !scope.namespaces.pid || !scope.rootIdentity?.dev || !scope.rootIdentity.ino
+      || proc.namespaces?.mount !== scope.namespaces.mount || proc.namespaces.pid !== scope.namespaces.pid
+      || proc.rootIdentity?.dev !== scope.rootIdentity.dev || proc.rootIdentity.ino !== scope.rootIdentity.ino) return { state: 'unknown', home: canonical }
     const socketPath = path.join(canonical, 'rpc.sock')
     const [socket, directory, unix, fds] = await Promise.all([
-      fs.lstat(socketPath), fs.stat(canonical), readLimited(`${PROC}/net/unix`, 1024 * 1024), fs.readdir(`${PROC}/${pid}/fd`)
+      hostFS.lstat(socketPath), hostFS.stat(canonical), readLimited(`${PROC}/net/unix`, 1024 * 1024), fs.readdir(`${PROC}/${pid}/fd`)
     ])
     if (!socket.isSocket() || socket.uid !== proc.uid || directory.uid !== proc.uid || fds.length > 8192) return { state: 'unknown', home: canonical }
     const inode = unix.split('\n').map(line => /^\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)\s+(.+)$/.exec(line.trim())).find(parts => parts?.[2] === socketPath)?.[1]
@@ -230,18 +256,33 @@ function ampDecode(buffer) {
 export async function pm2Call(daemon, method, argument) {
   if (!['getMonitorData', 'stopProcessId', 'startProcessId'].includes(method)) throw failure('forbidden', '不支持的管理操作')
   const fresh = await pm2Daemon(daemon.home)
-  if (fresh.state !== 'running' || fresh.pid !== daemon.pid || fresh.startTime !== daemon.startTime || fresh.socketInode !== daemon.socketInode) throw failure('identity-changed', 'PM2 实例已变化')
+  if (fresh.state !== 'running' || fresh.home !== daemon.home || fresh.pid !== daemon.pid || fresh.startTime !== daemon.startTime || fresh.socketInode !== daemon.socketInode || fresh.uid !== daemon.uid) throw failure('identity-changed', 'PM2 实例已变化')
+  const id = randomBytes(16).toString('hex')
+  const request = ampEncode([{ type: 'call', method, args: [argument] }, id])
+  const timeout = method === 'getMonitorData' ? 3500 : 15000
+  const confirmed = response => {
+    if (!response || response[1] !== id || !response[0] || response[0].error || !Array.isArray(response[0].args)) throw failure('manager-unavailable', 'PM2 操作未获确认')
+    return response[0].args[0]
+  }
+  if (containerMode) {
+    let content
+    try { content = await hostPm2Request(fresh, request, timeout) }
+    catch (error) { throw failure(error.code === 'manager-timeout' ? 'manager-timeout' : 'manager-unavailable', '无法确认已验证的 PM2 实例响应') }
+    try {
+      if (!Buffer.isBuffer(content) || content.length > LIMIT) throw new Error()
+      return confirmed(ampDecode(content))
+    } catch { throw failure('manager-unavailable', '无法解析或确认 PM2 响应') }
+  }
   return new Promise((resolve, reject) => {
-    const id = randomBytes(16).toString('hex')
     const socket = net.createConnection(path.join(daemon.home, 'rpc.sock'))
     let content = Buffer.alloc(0), settled = false
-    const timer = setTimeout(() => finish(failure('manager-timeout', 'PM2 操作未在限定时间内确认')), method === 'getMonitorData' ? 3500 : 15000)
+    const timer = setTimeout(() => finish(failure('manager-timeout', 'PM2 操作未在限定时间内确认')), timeout)
     const finish = (error, value) => {
       if (settled) return
       settled = true; clearTimeout(timer); socket.destroy()
       if (error) reject(error); else resolve(value)
     }
-    socket.on('connect', () => socket.write(ampEncode([{ type: 'call', method, args: [argument] }, id])))
+    socket.on('connect', () => socket.write(request))
     socket.on('error', () => finish(failure('manager-unavailable', '无法连接已验证的 PM2 实例')))
     socket.on('end', () => { if (!settled) finish(failure('manager-unavailable', 'PM2 连接中断')) })
     socket.on('data', chunk => {
@@ -250,8 +291,7 @@ export async function pm2Call(daemon, method, argument) {
         content = Buffer.concat([content, chunk])
         const response = ampDecode(content)
         if (!response) return
-        if (response[1] !== id || !response[0] || response[0].error || !Array.isArray(response[0].args)) return finish(failure('manager-unavailable', 'PM2 操作未获确认'))
-        finish(null, response[0].args[0])
+        finish(null, confirmed(response))
       } catch { finish(failure('manager-unavailable', '无法解析 PM2 响应')) }
     })
   })

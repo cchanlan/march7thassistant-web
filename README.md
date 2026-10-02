@@ -22,9 +22,84 @@
 
 ## 安装
 
-需要 **Linux、Node.js 18.18+**，建议使用仍受支持的 Node.js LTS。管理 Docker 还需要本机 Docker CLI 和访问本机 Docker daemon 的权限；管理原生实例需要能读取目标进程信息、配置，并具有对应托管服务的控制权限。
+Web 应部署在三月七所在的 Linux 机器上。浏览器里填写的是**服务器路径，不是访问者电脑的路径**。Docker 与原生安装二选一；已有面板占用 `18077` 时，请先为新部署设置不同的 `PORT`，不要重复占用端口。
 
-Web 应部署在能够访问三月七文件和运行管理器的机器上。浏览器里填写的是**服务器路径，不是访问者电脑的路径**。
+### Docker Compose
+
+需要 **Linux amd64、rootful Docker Engine 20.10+ 和 Docker Compose 2.20+**，运行命令的管理员须有本机 Docker 权限。镜像内包含 Node.js、Docker CLI 和宿主桥接程序，宿主不用另外安装 Node.js，也不会安装新的宿主常驻服务；镜像不包含三月七引擎、浏览器或 Docker daemon。
+
+该模式可以接入**宿主 PM2、systemd、源码/venv/uv 和 Docker 实例**，不是 Docker-only。仅支持同机、无 user namespace 重映射的 rootful Linux Docker；不承诺 rootless、`userns-remap`、Docker Desktop、远程 Docker daemon 或 ARM64 可用。
+
+**这是接近宿主 root 权限的管理容器，只供可信管理员使用。** Compose 共享宿主 PID、cgroup 和网络，添加 `SYS_ADMIN`、`SYS_CHROOT`、`SYS_PTRACE`、`DAC_READ_SEARCH`、`DAC_OVERRIDE`、`SETUID`、`SETGID`、`KILL`，并关闭默认 seccomp/AppArmor 限制。虽然没有启用 `privileged`、也没有挂载整个宿主 `/`，仍不是安全沙箱；Docker socket 同样具有高权限。
+
+在服务器终端执行：
+
+```sh
+mkdir -p march7th-web
+cd march7th-web
+curl -fL https://raw.githubusercontent.com/cchanlan/march7thassistant-web/main/compose.yaml -o compose.yaml
+docker compose up -d --wait
+docker compose exec -T web cat /var/lib/march7th-web/access.txt
+```
+
+默认地址为 `http://127.0.0.1:18077`。远程浏览器可先在自己的电脑运行以下命令，再打开该地址：
+
+```sh
+ssh -N -L 18077:127.0.0.1:18077 admin@服务器地址
+```
+
+首次登录后，点击右上角「修改密码」。`access.txt` 仅供初次领取，直接编辑它不会修改密码；自定义密码后该文件会被清理。忘记密码时，在部署目录的交互终端执行：
+
+```sh
+docker compose exec web node tools/reset-password.mjs
+```
+
+按提示输入两遍新密码并确认，无需重启面板；不要把密码写入命令参数。
+
+镜像地址为 `ghcr.io/cchanlan/march7thassistant-web:latest`。GHCR 镜像包的可见性独立于代码仓库，首次创建不会自动继承公开状态；若拉取提示 `denied`，请确认账号有读取权限，或联系维护者将镜像包设为公开。
+
+#### 宿主目录和用户服务
+
+扫描路径、PM2 目录及手动配置路径都填写**宿主机真实绝对路径**，不要添加 `/host` 前缀。默认扫描 `/root`、连接 `/root/.pm2`，systemd 用户 manager 使用宿主 UID `0`。需要管理其他用户时，在 `compose.yaml` 同目录创建或编辑 `.env`，例如：
+
+```dotenv
+M7A_SEARCH_ROOTS=/srv/starrail:/home/alice
+PM2_HOME=/home/alice/.pm2
+M7A_HOST_UID=1000
+```
+
+将示例路径与用户替换为实际值，用 `id -u alice` 获取准确 UID。用户级 systemd 服务要求该用户的 manager 已经运行；面板不会创建 manager 或启用 linger，系统级服务仍由系统 manager 管理。容器本身保持 `user: "0:0"`，不要把它改为该 UID。
+
+需要开放内网时，在同一 `.env` 中设置 `HOST=0.0.0.0`；需要改端口则设置 `PORT=18078`。HTTPS 反代同时设置 `M7A_PUBLIC_ORIGIN=https://settings.example.com`，并保留 Host 请求头。修改后执行：
+
+```sh
+docker compose up -d
+```
+
+采用 host 网络，不添加 `ports` 映射。**不要将 HTTP 端口直接暴露到公网。** 不要添加 `init: true`、tini 或替换入口命令，容器主进程必须直接运行 Node；停止宽限期为 3 分钟。
+
+#### 状态与备份
+
+Compose 只挂载本机 Docker socket 和独立的 `state` 命名卷。密码、连接、备份与缓存位于容器 `/var/lib/march7th-web`，**不要绑定原生部署正在使用的 `.state`**。同一宿主仅运行一个用于管理实例的面板；检测到另一个同镜像或已识别的面板时，会阻止同时管理，即使另一个面板没有挂载实例配置。其他共享宿主 PID 且拥有宿主命名空间访问能力的容器无法排除冲突时，也会保持只读。迁移或排错需临时并存时，各副本仍须使用不同 Compose project（`docker compose -p 名称 ...`）、状态卷和端口，不能借此绕过保护。
+
+在没有保存任务进行时，备份整个状态目录与部署配置：
+
+```sh
+umask 077
+backup="backups/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$backup"
+cp compose.yaml "$backup/"
+[ ! -f .env ] || cp .env "$backup/"
+docker compose stop web
+docker compose cp web:/var/lib/march7th-web/. "$backup/state"
+docker compose start web
+```
+
+请确认备份命令成功后再做迁移。备份包含敏感配置，妥善保存，不要上传公开仓库；不要使用 `docker compose down -v`，它会删除状态卷。这里只停止和启动 Web 面板，不操作三月七运行实例。
+
+### 原生安装
+
+需要 **Linux、Node.js 18.18+**，建议使用仍受支持的 Node.js LTS。管理 Docker 还需要本机 Docker CLI 和访问本机 Docker daemon 的权限；管理原生实例需要能读取目标进程信息、配置，并具有对应托管服务的控制权限。
 
 ```sh
 git clone https://github.com/cchanlan/march7thassistant-web.git
@@ -41,7 +116,7 @@ HOST=0.0.0.0 PORT=18077 npm start
 
 **不要把内网 HTTP 端口直接映射到公网。** Web 进程的文件权限、Docker 权限和服务管理权限非常高，应仅供可信管理员使用。
 
-### 领取初始密码
+#### 领取初始密码
 
 首次启动生成 `.state/access.txt`，在项目目录执行：
 
@@ -51,7 +126,7 @@ node -e "console.log(require('fs').readFileSync('.state/access.txt','utf8').trim
 
 该文件仅供初次领取，**直接编辑不会修改登录密码**。自定义密码后仅保存校验值，初始领取文件会被清理。
 
-### 后台运行
+#### 后台运行
 
 安装 PM2 后可使用仓库提供的配置，默认只监听本机回环地址：
 
@@ -117,7 +192,8 @@ Docker 的镜像名、容器名和标签只用于筛选候选，最终仍检查�
 | 仅配置文件 | 手动路径和配置特征 | 显式确认停止后仅写文件，不宣称已应用 |
 
 - 原本停止的目标，保存后仍保持停止。
-- 写入失败会尝试恢复原配置；如果连配置恢复也失败，实例保持停止，请先使用备份修复，不会带着未确认的配置自动启动。
+- 原生部署写入失败会尝试恢复原配置；如果连配置恢复也失败，实例保持停止，请先使用备份修复，不会带着未确认的配置自动启动。
+- 镜像模式采用更保守的故障锁：桥接写入报错、超时或断连后，当前目标保持停止，面板只读，其他实例不会继续被停止或写入。请先核对该次备份、目标配置与运行状态，必要时按原部署方式恢复实例，再在面板部署目录执行 `docker compose restart web`。重启面板不会自动启动三月七实例。
 - 识别出三月七文件，不等于有权限控制它；是否可读取、可写入、可安全恢复会分别展示。
 - 文件、目录 bind 挂载与命名卷需要分清。可核验宿主存储的本机 bind/local volume 支持保存；只读挂载、无法核验的卷子路径或插件卷、容器可写层保持只读。远程 Docker context 不在本版支持范围内。
 - **每个实例应使用独立配置文件。** 其他容器、相关本机进程或其他已连接配置指向同一文件时，禁止单独保存；补填容器名和选择「仅编辑文件」均不能绕过。其他容器尚未接入面板、甚至已经停止，也会参与挂载检查。
@@ -133,17 +209,25 @@ Docker 的镜像名、容器名和标签只用于筛选候选，最终仍检查�
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | Web 监听地址 |
-| `PORT` | `18077` | Web 端口 |
-| `M7A_STATE_DIR` | 项目目录 `.state` | 密码校验值、连接记录、备份与缓存 |
-| `M7A_SEARCH_ROOTS` | 服务用户主目录 | Linux 扫描目录，多个路径用冒号分隔 |
+| `HOST` | `127.0.0.1` | Web 监听地址；`0.0.0.0` 开放所有 IPv4 接口 |
+| `PORT` | `18077` | Web 端口；host 网络下直接使用宿主端口 |
+| `M7A_STATE_DIR` | 原生：项目 `.state`；镜像：`/var/lib/march7th-web` | 面板自己的密码校验值、连接记录、备份与缓存；修改镜像内路径时须同步状态卷挂载位置 |
+| `M7A_SEARCH_ROOTS` | 原生：服务用户主目录；Compose：`/root` | 宿主 Linux 扫描目录，多个路径用冒号分隔 |
 | `M7A_PUBLIC_ORIGIN` | 空 | HTTPS 反代的完整来源，例如 `https://settings.example.com` |
-| `M7A_READ_ONLY` | `0` | 设为 `1` 禁止修改实例配置，用于预览/检查 |
-| `PM2_HOME` | 服务用户 `.pm2` | 需要接入的 PM2 daemon 目录 |
+| `M7A_READ_ONLY` | `0` | 设为 `1` 禁止修改实例配置，用于预览/检查；不降低容器宿主权限 |
+| `PM2_HOME` | 原生：服务用户 `.pm2`；Compose：`/root/.pm2` | 需要接入的宿主 PM2 daemon 目录 |
+| `M7A_CONTAINER` | 原生：`0`；镜像：`1` | 启用宿主桥接；原生安装不要启用，容器安装不要关闭 |
+| `M7A_HOST_BRIDGE` | 项目 `tools/host-bridge/m7a-host-bridge`；镜像：`/usr/local/bin/m7a-host-bridge` | 容器内静态桥接程序路径；原生安装无需设置 |
+| `M7A_HOST_UID` | 容器：`0` | 宿主 systemd 用户 manager 的准确 UID，不是容器运行用户 |
+| `NODE_ENV` | 镜像：`production` | Node.js 生产运行环境 |
+
+Compose 还接受 `M7A_IMAGE`（默认 `ghcr.io/cchanlan/march7thassistant-web:latest`），可在 `.env` 中改为指定镜像标签或 digest；它不是面板运行环境变量。Compose 中 `M7A_CONTAINER`、`M7A_HOST_BRIDGE` 和 `M7A_STATE_DIR` 已固定为镜像对应值，无需在 `.env` 重复设置。
 
 反向代理应保留 Host，读取超时至少 180 秒，并配置 `M7A_PUBLIC_ORIGIN`。不支持把面板部署在 URL 子路径下。
 
-`.state/backups/` 中的备份和「导出配置」包含完整配置，可能含凭证，请勿分享。备份不会自动删除。运行目录不得放进公开 Git 仓库。
+镜像健康检查只请求不需要登录的 `/api/session`，不发现或读取实例；`healthy` 不等于宿主权限或每个目标均可用。请以登录后的检测结果为准。
+
+状态目录中的 `backups/` 和「导出配置」包含完整配置，可能含凭证，请勿分享。备份不会自动删除。状态目录不得放进公开 Git 仓库。
 
 网页登录采用 scrypt、HttpOnly/SameSite Cookie、CSRF、同源校验与登录限速。它不是多租户平台，也不是文件权限或 Docker 的安全沙箱。不要交给不可信用户，更不要提供未经保护的 Docker socket。
 
@@ -161,7 +245,16 @@ node tools/reset-password.mjs
 
 ## 更新
 
-更新本面板：
+**Compose 部署**在部署目录执行，保留现有 `.env` 和状态卷：
+
+```sh
+docker compose pull web
+docker compose up -d
+```
+
+如果固定了 `M7A_IMAGE`，先将其改为需要的版本。只更新面板，不更新三月七引擎；更新前建议按上文备份状态。
+
+**原生部署**更新代码和依赖后，按原来的运行方式重启面板：
 
 ```sh
 git pull --ff-only
@@ -169,9 +262,23 @@ npm ci
 pm2 restart march7th-web
 ```
 
+使用 systemd 时，最后一行改为 `sudo systemctl restart march7th-web.service`；前台运行则结束旧面板后执行 `npm start`。
+
 三月七本身更新后，重新读取所选实例时会核对其当前字段定义、版本和副本资料。读取失败会提示，不会自动覆盖用户配置。内置中文标题仅作展示补充；缺少可信定义的未知字段保持只读。
 
 ## 验证范围
+
+镜像目标为 `linux/amd64`，ARM64 尚未验证。已在 Linux 6.1、cgroup v2、Node.js 24.21.0、Docker 27.5.1 的隔离宿主中通过 **39 组 HTTP 回归**：
+
+- Docker 单文件/目录 bind、命名卷、数值 UID:GID、0640 权限、停止实例、只读挂载与入口核验。
+- 宿主 PM2、systemd 系统/用户服务、venv/uv，以及中文、emoji 和带空格的路径。
+- 多实例独立保存、跨目标/跨会话快照、并发与旧窗口冲突、软硬链接和跨部署共享保护。
+- 仅隔离 PID 的共享使用者、停止后新增共享者、客户端断连加 SIGTERM 时的保存与恢复。
+- 缺少宿主权限时只读、改密与重建后持久化，以及原生 Node 部署回归。
+
+另外通过镜像内 Docker CLI 27.5.1 对 Docker Engine 20.10.24 的版本协商和定向元数据读取检查；这不等同于在 20.10 上重跑完整矩阵。故障闭锁、原地写入恢复、严格 JSON/Unicode、私有管道和用户管理器端点另有隔离检查。测试使用无账号配置探针，不运行游戏任务。
+
+以下是**面板直接运行在宿主机时**的既有验证记录：
 
 已在 Linux、Node.js 24.19、Python 3.12、Docker 20.10.24、PM2 6.0.8、systemd 252 上验证：
 

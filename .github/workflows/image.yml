@@ -1,0 +1,124 @@
+name: Container image
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build amd64 image without publishing
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: march7thassistant-web:check
+          build-args: VCS_REF=${{ github.sha }}
+          provenance: false
+      - name: Check HTTP health and basic host bridge startup
+        shell: bash
+        env:
+          M7A_IMAGE: march7thassistant-web:check
+          HOST: 127.0.0.1
+          PORT: "18079"
+          M7A_SEARCH_ROOTS: /root/m7a-ci-empty
+          PM2_HOME: /root/m7a-ci-empty/.pm2
+          M7A_HOST_UID: "0"
+          M7A_PUBLIC_ORIGIN: ""
+          M7A_READ_ONLY: "1"
+        run: |
+          set -euo pipefail
+          project="m7a-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker compose -p "$project" down --volumes --remove-orphans
+          }
+          trap cleanup EXIT
+          docker compose -p "$project" config --quiet
+          docker compose -p "$project" up -d --wait --wait-timeout 90
+          cid="$(docker compose -p "$project" ps -q web)"
+          test -n "$cid"
+          docker compose -p "$project" exec -T web /usr/local/bin/m7a-host-bridge --version
+          docker compose -p "$project" exec -T web docker --version
+          pid="$(docker inspect --format '{{.State.Pid}}' "$cid")"
+          docker compose -p "$project" exec -T web node -e '
+            const fs = require("node:fs");
+            const pid = process.argv[1];
+            if (!/^[1-9][0-9]*$/.test(pid)) process.exit(1);
+            if (fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim() !== "node") process.exit(1);
+          ' "$pid"
+          # HTTP healthy 只表示面板可登录；必须另有成功握手证据。
+          # 只输出这条固定成功行，不公开其他状态日志，也不调用发现/登录接口。
+          docker compose -p "$project" logs --no-color web |
+            grep -F '[宿主桥接] 已核验容器与宿主身份'
+      - name: Export the checked image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker image inspect march7thassistant-web:check --format '{{.Id}}' > "$RUNNER_TEMP/image-id.txt"
+          docker save march7thassistant-web:check -o "$RUNNER_TEMP/march7th-image.tar"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: image-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/march7th-image.tar
+            ${{ runner.temp }}/image-id.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 1
+          overwrite: true
+
+  publish:
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-${{ github.run_id }}
+          path: ${{ runner.temp }}/checked-image
+          digest-mismatch: error
+      - name: Load and verify the checked image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker load -i "$RUNNER_TEMP/checked-image/march7th-image.tar"
+          test "$(docker image inspect march7thassistant-web:check --format '{{.Id}}')" = "$(cat "$RUNNER_TEMP/checked-image/image-id.txt")"
+          test "$(docker image inspect march7thassistant-web:check --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$GITHUB_SHA"
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the verified amd64 image without rebuilding
+        shell: bash
+        run: |
+          set -euo pipefail
+          image=ghcr.io/cchanlan/march7thassistant-web
+          docker tag march7thassistant-web:check "$image:sha-$GITHUB_SHA"
+          docker tag march7thassistant-web:check "$image:latest"
+          docker push "$image:sha-$GITHUB_SHA"
+          docker push "$image:latest"

@@ -3,6 +3,7 @@ import path from 'node:path'
 import tar from 'tar-stream'
 import { execute, hash, problem, inside, validateGameConfig, readLocal, writeLocal, fileIdentity, sameFile } from './io.mjs'
 import { scriptInvocation, processAt, isPython } from './processes.mjs'
+import { containerMode, hostFS, readHostFile, hostProcessFileIdentity, getHostScope, authorizeHost, canControlHost } from './host.mjs'
 import { parseConfigPath } from './native.mjs'
 
 const LIMIT = 2 * 1024 * 1024
@@ -17,9 +18,22 @@ function containerPath(value) {
   return path.posix.normalize(value)
 }
 async function docker(args, options = {}) {
-  return (await execute('docker', args, { timeout: 15000, maxBuffer: 6 * 1024 * 1024, ...options })).stdout
+  const env = { ...process.env }
+  if (containerMode) {
+    for (const key of ['DOCKER_CONTEXT', 'DOCKER_TLS_VERIFY', 'DOCKER_CERT_PATH', 'DOCKER_API_VERSION', 'DOCKER_CONFIG']) delete env[key]
+    env.DOCKER_HOST = 'unix:///var/run/docker.sock'
+    if (['stop', 'start'].includes(args[0])) {
+      await verifyContainerHost()
+      if (!canControlHost()) throw problem(503, '请核对上次保存的备份与实例状态，然后在部署目录执行 docker compose restart web')
+    }
+  }
+  return (await execute('docker', args, { timeout: 15000, maxBuffer: 6 * 1024 * 1024, ...options, env })).stdout
 }
 export async function localDocker() {
+  if (containerMode) {
+    if (!fs.statSync('/var/run/docker.sock').isSocket()) throw problem(503, '请挂载本机 Docker socket 后重建面板')
+    return
+  }
   let endpoint = process.env.DOCKER_HOST
   if (process.env.DOCKER_CONTEXT || !endpoint) {
     endpoint = JSON.parse(await docker(['context', 'inspect', ...(process.env.DOCKER_CONTEXT ? [process.env.DOCKER_CONTEXT] : []), '--format', '{{json .Endpoints.docker.Host}}']))
@@ -59,7 +73,7 @@ export async function writeDockerFile(runtime, original, next) {
   if (info.State.Running || info.Id !== runtime.containerId || containerDefinition(info) !== runtime.definition) throw problem(409, '容器状态已变化，未写入配置')
   const latest = await readDockerFile(info.Id, runtime.containerConfigPath)
   if (latest.text !== original.text || !runtime.storage?.identity) throw problem(409, '配置已变化，请重新载入')
-  const local = readLocal(runtime.storage.identity.actual)
+  const local = await readLocal(runtime.storage.identity.actual)
   if (!sameFile(local.identity, runtime.storage.identity) || local.text !== latest.text) throw problem(409, '配置挂载已变化，请重新接入')
   const write = (from, to) => writeLocal(local.actual, from, to, local.actual, runtime.storage.identity)
   try {
@@ -69,7 +83,7 @@ export async function writeDockerFile(runtime, original, next) {
     if (after.text !== next || after.header.uid !== latest.header.uid || after.header.gid !== latest.header.gid || (after.header.mode & 0o777) !== (latest.header.mode & 0o777)) throw problem(500, '配置内容或权限校验失败')
   } catch (error) {
     try {
-      const current = readLocal(local.actual).text
+      const current = (await readLocal(local.actual)).text
       if (current === next) await write(next, latest.text)
       else if (current !== latest.text) error.unsafeToStart = true
     } catch {
@@ -94,17 +108,19 @@ function containerDefinition(info) {
     (info.Mounts || []).map(m => [m.Type, m.Name || '', m.Source, m.Destination, m.RW]).sort((a, b) => a[3].localeCompare(b[3])),
     info.HostConfig?.ReadonlyRootfs, [...(info.HostConfig?.Mounts || [])].sort((a, b) => String(a.Target || a.Destination).localeCompare(String(b.Target || b.Destination)))])))
 }
-function storageFor(info, file) {
+async function storageFor(info, file) {
   const { mount, backingPath } = mapping(info, file)
   if (!backingPath) throw problem(409, '请为配置设置可核验的本机持久化挂载')
   const options = (info.HostConfig?.Mounts || []).find(m => (m.Target || m.Destination) === mount.Destination)
   if (options?.VolumeOptions?.Subpath) throw problem(409, '请使用可直接核验的配置挂载路径')
-  const identity = fileIdentity(backingPath)
-  const source = fs.realpathSync(mount.Source)
+  const identity = await fileIdentity(backingPath)
+  const source = await hostFS.realpath(mount.Source)
   if (identity.actual !== source && !inside(source, identity.actual)) throw problem(409, '请将配置链接改为明确的挂载文件')
   if (info.State?.Running) {
-    const stat = fs.statSync(`/proc/${info.State.Pid}/root${file}`, { bigint: true })
-    if (!stat.isFile() || !sameFile(identity, { dev: String(stat.dev), ino: String(stat.ino) })) throw problem(409, '配置挂载已变化，请核对挂载后重新接入')
+    const proc = await processAt(info.State.Pid)
+    if (!proc) throw problem(409, '容器进程已变化，请重新载入')
+    const actual = await hostProcessFileIdentity(proc.pid, file, proc.startTime)
+    if (!sameFile(identity, actual)) throw problem(409, '配置挂载已变化，请核对挂载后重新接入')
   }
   return { identity, type: mount.Type, location: [mount.Name || mount.Source, path.posix.relative(mount.Destination, file)] }
 }
@@ -141,30 +157,69 @@ async function launchFor(info, selectedRoot, verifyProcess = true) {
   }
   return { root: selectedRoot, script, fingerprint: hash(JSON.stringify([argv, wrapper, root, script])) }
 }
-const INSPECT_METADATA = '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Path":{{json .Path}},"Args":{{json .Args}},"Config":{"WorkingDir":{{json .Config.WorkingDir}}},"State":{"Running":{{json .State.Running}},"Pid":{{json .State.Pid}}},"Mounts":{{json .Mounts}},"HostConfig":{"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"Mounts":{{json (index .HostConfig "Mounts")}}}}'
-async function containerInventory() {
+const INSPECT_METADATA = '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Path":{{json .Path}},"Args":{{json .Args}},"Config":{"WorkingDir":{{json .Config.WorkingDir}}},"State":{"Running":{{json .State.Running}},"Pid":{{json .State.Pid}}},"Mounts":{{json .Mounts}},"HostConfig":{"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"Mounts":{{json (index .HostConfig "Mounts")}},"PidMode":{{json .HostConfig.PidMode}},"NetworkMode":{{json .HostConfig.NetworkMode}},"UsernsMode":{{json .HostConfig.UsernsMode}},"Privileged":{{json .HostConfig.Privileged}},"CapAdd":{{json .HostConfig.CapAdd}}}}'
+const SELF_METADATA = '{"Id":{{json .Id}},"Image":{{json .Image}},"State":{"Running":{{json .State.Running}},"Pid":{{json .State.Pid}}},"HostConfig":{"PidMode":{{json .HostConfig.PidMode}},"NetworkMode":{{json .HostConfig.NetworkMode}},"UsernsMode":{{json .HostConfig.UsernsMode}}}}'
+async function containerInventory(format = INSPECT_METADATA) {
   await localDocker()
   const list = async () => (await docker(['ps', '-aq', '--no-trunc'])).trim().split(/\r?\n/).filter(Boolean).sort()
   const ids = await list()
   if (ids.length > 256 || ids.some(id => !/^[a-f0-9]{64}$/.test(id))) throw problem(409, '请缩小管理范围后重新检查实例')
   const items = []
   for (let i = 0; i < ids.length; i += 32) {
-    const text = await docker(['inspect', '--type', 'container', '--format', INSPECT_METADATA, ...ids.slice(i, i + 32)])
+    const text = await docker(['inspect', '--type', 'container', '--format', format, ...ids.slice(i, i + 32)])
     items.push(...text.trim().split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line)))
   }
   if (JSON.stringify(ids) !== JSON.stringify(items.map(item => item.Id).sort()) || JSON.stringify(ids) !== JSON.stringify(await list())) throw problem(409, '实例列表已变化，请重新检查')
   return items
 }
-function mountMayExpose(info, identity) {
-  return (info.Mounts || []).some(m => {
-    if (!['bind', 'volume'].includes(m.Type) || !path.isAbsolute(m.Source || '')) return false
-    try {
-      const source = fs.realpathSync(m.Source)
-      if (inside(source, identity.actual)) return true
-      if (fs.statSync(source).isFile()) return sameFile(fileIdentity(source), identity)
-    } catch { return inside(m.Source, identity.actual) }
-    return false
+export async function verifyContainerHost(snapshot, inventory) {
+  if (!containerMode) return null
+  const deny = () => problem(503, '请按镜像部署说明检查宿主权限后重建面板')
+  if (process.getuid() !== 0 || (snapshot && !snapshot.complete)) throw deny()
+  const scope = await getHostScope()
+  const before = await processAt(process.pid), init = await processAt(1)
+  if (!before || !init || before.namespaces?.pid !== scope.namespaces?.pid || init.namespaces?.mount !== scope.namespaces?.mount || !sameFile(init.rootIdentity, scope.rootIdentity)) throw deny()
+  if (before.namespaces.mount === scope.namespaces.mount || sameFile(before.rootIdentity, scope.rootIdentity)) throw deny()
+  for (const namespace of ['net', 'cgroup']) if (fs.readlinkSync(`/proc/self/ns/${namespace}`) !== fs.readlinkSync(`/proc/1/ns/${namespace}`)) throw deny()
+  for (const file of ['uid_map', 'gid_map']) if (!/^\s*0\s+0\s+4294967295\s*$/.test(fs.readFileSync(`/proc/self/${file}`, 'utf8'))) throw deny()
+  const [localSocket, hostSocket] = await Promise.all([
+    fs.promises.stat('/var/run/docker.sock', { bigint: true }), hostFS.stat('/var/run/docker.sock', { bigint: true })
+  ])
+  if (!localSocket.isSocket() || !hostSocket.isSocket() || localSocket.dev !== hostSocket.dev || localSocket.ino !== hostSocket.ino) throw deny()
+  const security = JSON.parse(await docker(['info', '--format', '{{json .SecurityOptions}}']))
+  if (!Array.isArray(security) || security.some(option => /rootless|userns/i.test(option))) throw deny()
+  const items = inventory || await containerInventory(SELF_METADATA)
+  const matches = items.filter(info => info.State?.Running && info.State.Pid === process.pid)
+  if (matches.length !== 1) throw deny()
+  const own = matches[0]
+  const ownsCgroup = before.cgroup.split('\n').some(line => {
+    const start = line.indexOf(':', line.indexOf(':') + 1)
+    return start >= 0 && line.slice(start + 1).split('/').some(part => part === own.Id || part === `docker-${own.Id}.scope`)
   })
+  if (!ownsCgroup) throw deny()
+  if (own.HostConfig?.PidMode !== 'host' || own.HostConfig?.NetworkMode !== 'host' || !['', 'host'].includes(own.HostConfig?.UsernsMode || '')) throw deny()
+  const observer = snapshot?.observer || before
+  if (before.namespaces.mount !== observer.namespaces?.mount || !sameFile(before.rootIdentity, observer.rootIdentity)) throw deny()
+  // Only the current Node process is a management exemption, never an image/name/label.
+  if (snapshot?.processes.some(proc => proc.pid !== process.pid && proc.namespaces?.mount === before.namespaces.mount && sameFile(proc.rootIdentity, before.rootIdentity) && (isPython(proc.argv?.[0]) || path.basename(proc.argv?.[0] || '') === 'uv'))) throw deny()
+  const after = await processAt(process.pid)
+  if (!after || after.startTime !== before.startTime || after.namespaces.mount !== before.namespaces.mount || !sameFile(after.rootIdentity, before.rootIdentity)) throw deny()
+  await authorizeHost({ pid: process.pid, startTime: after.startTime, scope })
+  return own
+}
+async function mountMayExpose(info, identity) {
+  for (const mount of info.Mounts || []) {
+    if (!['bind', 'volume'].includes(mount.Type) || !path.isAbsolute(mount.Source || '')) continue
+    try {
+      const source = await hostFS.realpath(mount.Source)
+      if (inside(source, identity.actual)) return true
+      if ((await hostFS.stat(source)).isFile() && sameFile(await fileIdentity(source), identity)) return true
+    } catch {
+      // An inaccessible mount must not silently become proof of independent storage.
+      throw problem(409, '请检查挂载访问权限后重新载入')
+    }
+  }
+  return false
 }
 export async function observeDockerConfigUsers(identity, snapshot, runtime) {
   const users = [], warnings = []
@@ -177,6 +232,25 @@ export async function observeDockerConfigUsers(identity, snapshot, runtime) {
     if (error.code === 'ENOENT' && !dockerPresent) return { users, complete, warnings }
     console.warn('[配置隔离] Docker 清单未完成', error.code || error.status || 'unknown')
     return { users, complete: false, warnings: ['请检查 Docker 访问权限后重新载入'] }
+  }
+  let panel = null
+  if (containerMode) {
+    try { panel = await verifyContainerHost(snapshot, items) }
+    catch (error) {
+      console.warn('[宿主桥接] 容器身份核验未完成', error.code || error.status || 'unknown')
+      return { users, complete: false, warnings: ['请按镜像部署说明检查宿主权限后重建面板'] }
+    }
+  }
+  if (panel) {
+    for (const proc of snapshot.processes) {
+      if (proc.pid === process.pid || proc.namespaces?.mount !== snapshot.hostScope?.namespaces?.mount || !sameFile(proc.rootIdentity, snapshot.hostScope?.rootIdentity) || !/^node(?:js)?$/.test(path.posix.basename(proc.argv?.[0] || '')) || !proc.cwd?.startsWith('/')) continue
+      const entries = proc.argv.slice(1).filter(arg => path.posix.basename(arg) === 'server.mjs').slice(0, 4)
+      for (const entry of entries) {
+        let peer = false
+        try { peer = JSON.parse(await readHostFile(path.posix.join(path.posix.dirname(path.posix.resolve(proc.cwd, entry)), 'package.json'), 65536)).name === 'march7thassistant-web' } catch {}
+        if (peer) return { users, complete: false, warnings: ['请只保留一个正在运行的配置面板后再保存'] }
+      }
+    }
   }
   if (runtime.kind === 'docker') {
     const own = items.find(info => info.Id === runtime.containerId)
@@ -198,9 +272,31 @@ export async function observeDockerConfigUsers(identity, snapshot, runtime) {
     }
   }
   for (const info of items) {
-    if (info.Id === runtime.containerId) continue
-    const exposed = mountMayExpose(info, identity)
+    if (info.Id === runtime.containerId || info.Id === panel?.Id) continue
+    let exposed
+    try { exposed = await mountMayExpose(info, identity) }
+    catch { complete = false; continue }
     const root = info.Config?.WorkingDir
+    if (panel && info.State.Running && info.HostConfig?.PidMode === 'host') {
+      // Host-namespace access does not require a config mount. Unknown privileged
+      // peers must not become 'independent' just because cwd/package.json is absent.
+      const hostAccess = info.HostConfig.Privileged || (info.HostConfig.CapAdd || []).some(cap => /^(?:CAP_)?SYS_ADMIN$/i.test(cap))
+      const roots = new Set(typeof root === 'string' && root.startsWith('/') ? [root] : [])
+      const init = snapshot.processes.find(proc => proc.pid === info.State.Pid)
+      if (init?.cwd?.startsWith('/') && /^node(?:js)?$/.test(path.posix.basename(init.argv?.[0] || ''))) {
+        for (const arg of init.argv.slice(1)) if (!arg.startsWith('-') && /\.(?:mjs|cjs|js)$/.test(arg)) roots.add(path.posix.dirname(path.posix.resolve(init.cwd, arg)))
+      }
+      let peer = info.Image === panel.Image
+      for (const directory of [...roots].slice(0, 4)) {
+        if (peer) break
+        try { peer = JSON.parse((await readDockerFile(info.Id, path.posix.join(directory, 'package.json'))).text).name === 'march7thassistant-web' } catch {}
+      }
+      if (peer || hostAccess) {
+        complete = false
+        warnings.push(peer ? '请只保留一个正在运行的配置面板后再保存' : '请核对其他宿主管理容器后重新载入')
+        continue
+      }
+    }
     if (typeof root !== 'string' || !root.startsWith('/')) { if (exposed) complete = false; continue }
     let declaration
     try { declaration = (await readDockerFile(info.Id, path.posix.join(root, 'module/config/__init__.py'))).text }
@@ -215,7 +311,7 @@ export async function observeDockerConfigUsers(identity, snapshot, runtime) {
         if (!await launchFor(info, path.posix.normalize(root))) complete = false
         continue
       }
-      const storage = storageFor(info, file)
+      const storage = await storageFor(info, file)
       if (sameFile(storage.identity, identity)) users.push({ containerId: info.Id, label: info.Name.replace(/^\//, '') })
       else if (!await launchFor(info, path.posix.normalize(root))) complete = false
     } catch { complete = false }
@@ -254,15 +350,15 @@ export async function inspectDocker(spec) {
   let sameHost = true
   if (spec.configPath) {
     try {
-      sameHost = !!hostPath && fs.realpathSync(hostPath) === fs.realpathSync(spec.configPath) && fs.readFileSync(spec.configPath, 'utf8') === config.text
+      sameHost = !!hostPath && await hostFS.realpath(hostPath) === await hostFS.realpath(spec.configPath) && (await readLocal(spec.configPath)).text === config.text
     } catch { sameHost = false }
     if (!sameHost) warnings.push('手动路径与容器实际配置不一致，请核对挂载和所选实例')
   }
   let hostWritable = false, storage = null
   try {
-    storage = storageFor(info, file)
-    const local = readLocal(storage.identity.actual)
-    fs.accessSync(local.actual, fs.constants.W_OK)
+    storage = await storageFor(info, file)
+    const local = await readLocal(storage.identity.actual)
+    await hostFS.access(local.actual, fs.constants.W_OK)
     if (!sameFile(local.identity, storage.identity) || local.text !== config.text) throw problem(409, '配置挂载已变化，请重新接入')
     hostWritable = true
   } catch (error) {
