@@ -58,15 +58,19 @@ jobs:
           docker compose -p "$project" exec -T web docker --version
           pid="$(docker inspect --format '{{.State.Pid}}' "$cid")"
           docker compose -p "$project" exec -T web node -e '
-            const fs = require("node:fs");
+            const fs = require("node:fs"), path = require("node:path");
             const pid = process.argv[1];
             if (!/^[1-9][0-9]*$/.test(pid)) process.exit(1);
-            if (fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim() !== "node") process.exit(1);
+            // New Node versions may name the main thread MainThread; check its executable.
+            if (!/^node(?:js)?$/.test(path.basename(fs.readlinkSync(`/proc/${pid}/exe`)))) process.exit(1);
           ' "$pid"
           # HTTP healthy 只表示面板可登录；必须另有成功握手证据。
-          # 只输出这条固定成功行，不公开其他状态日志，也不调用发现/登录接口。
-          docker compose -p "$project" logs --no-color web |
-            grep -F '[宿主桥接] 已核验容器与宿主身份'
+          # 只输出宿主桥接的固定诊断，不公开其他状态日志，也不调用发现/登录接口。
+          if ! docker compose -p "$project" logs --no-color web |
+            grep -F '[宿主桥接] 已核验容器与宿主身份'; then
+            docker compose -p "$project" logs --no-color web | grep -F '[宿主桥接]' || true
+            exit 1
+          fi
       - name: Export the checked image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
