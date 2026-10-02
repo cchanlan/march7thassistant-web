@@ -56,7 +56,7 @@ docker compose exec web node tools/reset-password.mjs
 
 按提示输入两遍新密码并确认，无需重启面板；不要把密码写入命令参数。
 
-镜像地址为 `ghcr.io/cchanlan/march7thassistant-web:latest`。GHCR 镜像包的可见性独立于代码仓库，首次创建不会自动继承公开状态；若拉取提示 `denied`，请确认账号有读取权限，或联系维护者将镜像包设为公开。
+镜像地址为 `ghcr.io/cchanlan/march7thassistant-web:latest`，**无需登录即可拉取**。同时提供 `sha-完整提交号` 标签，便于固定版本。
 
 #### 宿主目录和用户服务
 
