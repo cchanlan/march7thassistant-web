@@ -411,7 +411,8 @@
           "label": "二相乐园",
           "value": 6
         }
-      ]
+      ],
+      "mixedOptions": true
     },
     "fight_reward_enable": {
       "label": "启用「特殊物品领取」"
@@ -431,7 +432,8 @@
           "label": "停用",
           "value": false
         }
-      ]
+      ],
+      "mixedOptions": true
     },
     "fight_allow_map_buy": {
       "label": "购买代币与过期邮包",
@@ -448,7 +450,8 @@
           "label": "停用",
           "value": false
         }
-      ]
+      ],
+      "mixedOptions": true
     },
     "fight_allow_memory_token": {
       "label": "获得翁法罗斯记忆代币",
@@ -465,7 +468,8 @@
           "label": "停用",
           "value": false
         }
-      ]
+      ],
+      "mixedOptions": true
     },
     "forgottenhall_enable": {
       "label": "启用混沌回忆"

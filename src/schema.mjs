@@ -51,8 +51,8 @@ export function createSchema(defaultText, metadata = seedMetadata) {
     browser_type: ['integrated', 'edge', 'chrome', 'chromium'],
     build_target_scheme: { '副本名称识别': 'instance', '掉落物识别': 'drop' },
     currencywars_type: { '标准博弈': 'normal', '超频博弈': 'overclock' },
-    currencywars_rank_difficulty: { '当前职级': 'current', '最低职级': 'lowest', '最高职级': 'highest' },
-    currencywars_strategy: { '默认': 'default', '阿格莱雅': 'aglaea' },
+    currencywars_rank_difficulty: { '当前职级': 'current', '最低职级': 'lowest', '最高职级': 'highest', '晋升点封顶档': 'promotion_cap' },
+    currencywars_strategy: { '默认': 'default', '连击那刻夏（S2）': 's2_anaxa', '连击那刻夏（高难）': 's2_anaxa_high' },
     calyx_golden_preference: { '雅利洛-VI': 'Jarilo-VI', '仙舟「罗浮」': 'XianzhouLuofu', '匹诺康尼': 'Penacony' },
     weekly_divergent_type: { '常规演算': 'normal', '周期演算': 'cycle' },
     divergent_type: { '常规演算': 'normal', '周期演算': 'cycle' },
@@ -117,7 +117,8 @@ export function createSchema(defaultText, metadata = seedMetadata) {
   function normalizedOptions(key, type) {
     const raw = optionValues[key]
     let options = raw ? (Array.isArray(raw) ? raw.map(v => ({ label: v, value: v })) : Object.entries(raw).map(([label, value]) => ({ label, value }))) : metadata.fields[key]?.options
-    if (!options || !options.every(o => o.value === null || typeOf(o.value) === type)) return undefined
+    // 上游有些菜单本身就混存字符串/布尔/数字（如「不配置」+ true/false），按 mixedOptions 放行。
+    if (!options || (!metadata.fields[key]?.mixedOptions && !options.every(o => o.value === null || typeOf(o.value) === type))) return undefined
     // 桌面端某些下拉菜单的显示值另有映射，不能把中文标签当作实际存储值。
     if (!raw && !options.some(o => same(o.value, defaults[key]))) return undefined
     return options
@@ -153,7 +154,8 @@ export function createSchema(defaultText, metadata = seedMetadata) {
   function validateChange(field, value) {
     if (!field || field.readonly) throw new Error('该设置暂不可修改')
     checkStructure(value)
-    if (field.type !== 'null' && value !== null && typeOf(value) !== field.type) throw new Error(`${field.label}：填写格式不正确`)
+    const picked = !!field.options && field.options.some(o => same(o.value, value))
+    if (field.type !== 'null' && value !== null && typeOf(value) !== field.type && !picked) throw new Error(`${field.label}：填写格式不正确`)
     if (typeof value === 'string' && value.length > 32000) throw new Error(`${field.label}：内容过长`)
     if (typeof value === 'number') {
       if (!Number.isFinite(value) || (field.integer && !Number.isSafeInteger(value))) throw new Error(`${field.label}：请填写有效数字`)
