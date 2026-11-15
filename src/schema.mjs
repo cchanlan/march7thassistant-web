@@ -14,7 +14,7 @@ export function createSchema(defaultText, metadata = seedMetadata) {
     { id: 'power', title: '体力与培养', icon: '✧' },
     { id: 'daily', title: '日常与奖励', icon: '☀' },
     { id: 'weekly', title: '周常与挑战', icon: '◇' },
-    { id: 'cloud', title: '云游戏与浏览器', icon: '☁' },
+    { id: 'cloud', title: '设备与云游戏', icon: '☁' },
     { id: 'schedule', title: '运行与定时', icon: '◷' },
     { id: 'notify', title: '消息推送', icon: '✉' },
     { id: 'advanced', title: '更多设置', icon: '⚙' },
@@ -38,7 +38,7 @@ export function createSchema(defaultText, metadata = seedMetadata) {
     currencywars_enable: '启用货币战争', scheduled_time: '循环运行时间',
     scheduled_tasks: '桌面端定时任务', after_finish: '任务完成后',
     cloud_game_enable: '启用云游戏', browser_headless_enable: '无窗口运行',
-    loop_mode: '循环模式', power_limit: '循环所需开拓力', refresh_hour: '每日刷新时间',
+    loop_mode: '循环模式', refresh_hour: '每日刷新时间',
     notification_enable: '启用消息推送', notify_template: '消息模板',
     log_level: '日志级别', log_retention_days: '日志保留天数',
     calyx_golden_preference: '拟造花萼（金）偏好地区',
@@ -67,8 +67,11 @@ export function createSchema(defaultText, metadata = seedMetadata) {
     weekly_divergent_level: [1, 6], echo_of_war_start_day_of_week: [1, 7],
     weekly_relic_cleanup_day_of_week: [1, 7],
     build_target_ornament_weekly_count: [0, 7], browser_scale_factor: [0.1, 5],
-    power_limit: [0, 300], log_retention_days: [1, 3650],
+    log_retention_days: [1, 3650], adb_tap_ms: [1, 10000],
+    ocr_slow_threshold: [0.1, 3600],
   }
+  // 模板里默认留空的字符串配置：前端按文本框编辑，留空保存时仍写回 null。
+  const emptyAsNull = new Set(['control_backend', 'adb_path', 'adb_serial', 'adb_service_jar'])
   const secrets = /token|password|secret|sctkey|sendkey|cdk|webhook(?:$|_url$|_headers$|_body$)|headers|^notify_.*_key$|^notify_custom_(url|data|image)$/i
   const runtime = /timestamp$|_completed_count$|^already_used_codes$|^daily_tasks$|^telemetry_(id|secret)$|_requirements$|^window_(width|height|x|y|maximized)$|^home_cards$/
   const common = new Set(['power_enable', 'instance_type', 'instance_names', 'build_target_enable', 'break_down_level_four_relicset', 'currencywars_enable', 'daily_enable', 'reward_enable', 'weekly_divergent_enable', 'scheduled_time', 'loop_mode', 'notification_enable'])
@@ -96,11 +99,11 @@ export function createSchema(defaultText, metadata = seedMetadata) {
   function category(key) {
     if (runtime.test(key)) return 'runtime'
     if (/^(notify_|notification_)/.test(key)) return 'notify'
-    if (/^(cloud_game_|browser_)/.test(key)) return 'cloud'
-    if (/^(power_|instance_|build_target_|borrow_|echo_of_war_|calyx_|tp_before_|break_down_|merge_|use_fuel$|use_reserved_)/.test(key)) return 'power'
+    if (/^(cloud_game_|browser_|adb_|control_backend$|ui_profile$|local_control_mode$|background_mouse_protection$)/.test(key)) return 'cloud'
+    if (/^(power_|instance_|build_target_|borrow_|echo_of_war_|calyx_|tp_before_|break_down_|merge_|relic_bag_cleanup_|use_fuel$|use_reserved_)/.test(key)) return 'power'
     if (/^(daily_|reward_|activity_|asset_)/.test(key)) return 'daily'
     if (/^(currencywars_|weekly_|universe_|divergent_|fight_|forgottenhall_|purefiction_|apocalyptic_)/.test(key)) return 'weekly'
-    if (/^(scheduled_|loop_mode$|power_limit$|refresh_hour$|after_finish$|pause_after_success$|exit_after_failure$|play_audio$|script_path$)/.test(key)) return 'schedule'
+    if (/^(scheduled_|loop_mode$|refresh_hour$|after_finish$|pause_after_success$|exit_after_failure$|play_audio$|script_path$|autostart_|no_run_immediately$|exit_app_after_success$|game_launch_method$|game_optimization_enable$|auto_lower_graphics_enable$)/.test(key)) return 'schedule'
     return 'advanced'
   }
   function typeOf(value) {
@@ -114,7 +117,7 @@ export function createSchema(defaultText, metadata = seedMetadata) {
   function normalizedOptions(key, type) {
     const raw = optionValues[key]
     let options = raw ? (Array.isArray(raw) ? raw.map(v => ({ label: v, value: v })) : Object.entries(raw).map(([label, value]) => ({ label, value }))) : metadata.fields[key]?.options
-    if (!options || !options.every(o => typeOf(o.value) === type)) return undefined
+    if (!options || !options.every(o => o.value === null || typeOf(o.value) === type)) return undefined
     // 桌面端某些下拉菜单的显示值另有映射，不能把中文标签当作实际存储值。
     if (!raw && !options.some(o => same(o.value, defaults[key]))) return undefined
     return options
@@ -124,7 +127,7 @@ export function createSchema(defaultText, metadata = seedMetadata) {
     return Object.keys(data).map(key => {
       const value = data[key]
       const def = own(defaults, key) ? defaults[key] : value
-      const type = typeOf(def)
+      const type = emptyAsNull.has(key) ? 'string' : typeOf(def)
       const description = descriptionFor(key, doc)
       const info = metadata.fields[key] || {}
       const group = category(key)
@@ -138,7 +141,7 @@ export function createSchema(defaultText, metadata = seedMetadata) {
       if (!field.secret) field.value = value
       else field.configured = value !== '' && value != null
       if (!own(defaults, key)) { field.unknown = true; field.readonly = true }
-      if (typeOf(value) !== type && type !== 'null') {
+      if (typeOf(value) !== type && type !== 'null' && value !== null) {
         field.warning = type === 'boolean' ? '请选择开启或关闭后保存。' : '请检查填写格式后保存。'
         field.invalidType = true
       }
@@ -150,14 +153,14 @@ export function createSchema(defaultText, metadata = seedMetadata) {
   function validateChange(field, value) {
     if (!field || field.readonly) throw new Error('该设置暂不可修改')
     checkStructure(value)
-    if (field.type !== 'null' && typeOf(value) !== field.type) throw new Error(`${field.label}：填写格式不正确`)
+    if (field.type !== 'null' && value !== null && typeOf(value) !== field.type) throw new Error(`${field.label}：填写格式不正确`)
     if (typeof value === 'string' && value.length > 32000) throw new Error(`${field.label}：内容过长`)
     if (typeof value === 'number') {
       if (!Number.isFinite(value) || (field.integer && !Number.isSafeInteger(value))) throw new Error(`${field.label}：请填写有效数字`)
       if (field.range && (value < field.range[0] || value > field.range[1])) throw new Error(`${field.label}：请填写 ${field.range[0]}～${field.range[1]}`)
       if (!field.range && value < 0) throw new Error(`${field.label}：不能小于 0`)
     }
-    if (field.options && !field.options.some(o => same(o.value, value))) throw new Error(`${field.label}：请选择列表中的选项`)
+    if (field.options && !field.options.some(o => same(o.value, value)) && !(emptyAsNull.has(field.key) && value === '')) throw new Error(`${field.label}：请选择列表中的选项`)
     if (['scheduled_time', 'scheduled_run_time'].includes(field.key) && !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(value)) throw new Error('运行时间：请填写 HH:mm')
     if (/team_number$/.test(field.key) && !/^(?:[1-9]|10)$/.test(value)) throw new Error('队伍编号：请填写 1～10')
     if (field.key === 'instance_names') {
@@ -180,8 +183,8 @@ export function createSchema(defaultText, metadata = seedMetadata) {
       const max = field.key.startsWith('forgottenhall') ? 12 : 4
       if (value.length !== 2 || value.some(n => !Number.isInteger(n) || n < 1 || n > max) || value[0] > value[1]) throw new Error(`关卡范围：请填写从小到大的两个数字，范围 1～${max}`)
     }
-    if (/^(daily_memory_one_team|(?:forgottenhall|purefiction|apocalyptic)_team[12])$/.test(field.key)) {
-      if (value.length !== 4 || value.some(v => !Array.isArray(v) || v.length !== 2 || typeof v[0] !== 'string' || !Number.isInteger(v[1]) || v[1] < -1 || v[1] > 5)) throw new Error('队伍配置：需要四名角色，秘技次数为 -1～5')
+    if (/^(daily_memory_one_team|(?:forgottenhall|purefiction|apocalyptic)_team[123])$/.test(field.key)) {
+      if (!Array.isArray(value) || value.length < 1 || value.length > 4 || value.some(v => !Array.isArray(v) || v.length !== 2 || typeof v[0] !== 'string' || !Number.isInteger(v[1]) || v[1] < -1 || v[1] > 5)) throw new Error('队伍配置：需要 1～4 名角色，秘技次数为 -1～5')
     }
     if (field.key === 'scheduled_tasks') {
       const ids = new Set()
@@ -209,8 +212,12 @@ export function createSchema(defaultText, metadata = seedMetadata) {
     return node
   }
   function applyChanges(doc, changes) {
-    for (const { key, value } of changes) doc.set(key, patchNode(doc, doc.get(key, true), value))
-    const text = doc.toString({ lineWidth: 0 })
+    for (const { key, value } of changes) {
+      const next = emptyAsNull.has(key) && value === '' ? null : value
+      if (next === null) doc.set(key, null)
+      else doc.set(key, patchNode(doc, doc.get(key, true), next))
+    }
+    const text = doc.toString({ lineWidth: 0, indentSeq: false, nullStr: '' })
     parseConfig(text)
     return text
   }

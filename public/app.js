@@ -469,7 +469,7 @@ function renderFields() {
     if (!buckets.has(key)) buckets.set(key, [])
     buckets.get(key).push(field)
   }
-  const notifyTitles = { notify_telegram: 'Telegram', notify_matrix: 'Matrix', notify_serverchanturbo: 'Server 酱 · Turbo', notify_serverchan3: 'Server 酱 · 3', notify_bark: 'Bark', notify_smtp: '邮件', notify_onebot: 'OneBot · QQ', notify_gocqhttp: 'Go-cqhttp', notify_dingtalk: '钉钉', notify_pushplus: 'PushPlus', notify_qmsg: 'Qmsg', notify_wechatworkapp: '企业微信应用', notify_wechatworkbot: '企业微信机器人', notify_gotify: 'Gotify', notify_discord: 'Discord', notify_pushdeer: 'PushDeer', notify_lark: '飞书', notify_kook: 'KOOK', notify_meow: 'MeoW', notify_webhook: 'Webhook', notify_custom: '自定义推送' }
+  const notifyTitles = { notify_telegram: 'Telegram', notify_matrix: 'Matrix', notify_serverchanturbo: 'Server 酱 · Turbo', notify_serverchan3: 'Server 酱 · 3', notify_bark: 'Bark', notify_smtp: '邮件', notify_onebot: 'OneBot · QQ', notify_gocqhttp: 'Go-cqhttp', notify_dingtalk: '钉钉', notify_pushplus: 'PushPlus', notify_qmsg: 'Qmsg', notify_wechatworkapp: '企业微信应用', notify_wechatworkbot: '企业微信机器人', notify_gotify: 'Gotify', notify_discord: 'Discord', notify_pushdeer: 'PushDeer', notify_lark: '飞书', notify_kook: 'KOOK', notify_qqbot: 'QQ 官方机器人', notify_meow: 'MeoW', notify_webhook: 'Webhook', notify_custom: '自定义推送' }
   for (const [key, items] of buckets) {
     const card = node('section', 'settings-card')
     const info = state.data.groups.find(g => g.id === items[0].group)
