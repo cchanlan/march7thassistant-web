@@ -46,13 +46,16 @@ async function body(req) {
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { throw problem(400, '提交格式不正确') }
 }
 function verifyRequest(req) {
-  let origin
+  let url
   try {
-    const url = new URL(`http://${req.headers.host}`)
+    url = new URL(`http://${req.headers.host}`)
     if (url.username || url.password || (!allowedHosts.has(url.hostname) && (!publicOrigin || url.host !== new URL(publicOrigin).host))) throw new Error()
-    origin = publicOrigin || url.origin
   } catch { throw problem(403, '访问地址未授权') }
-  if (!['GET', 'HEAD'].includes(req.method) && req.headers.origin !== origin) throw problem(403, '请从设置页面操作')
+  if (['GET', 'HEAD'].includes(req.method)) return
+  // 局域网 IP 和配置的公开域名都算合法来源，其余一律按跨站请求拒绝。
+  const allowedOrigins = new Set([url.origin])
+  if (publicOrigin) allowedOrigins.add(publicOrigin)
+  if (!allowedOrigins.has(req.headers.origin)) throw problem(403, '请从设置页面操作')
 }
 function sessionFor(req) {
   const cookie = (req.headers.cookie || '').split(';').map(s => s.trim()).find(s => s.startsWith(`${cookieName}=`))
